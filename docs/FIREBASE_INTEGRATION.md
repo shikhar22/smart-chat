@@ -20,8 +20,8 @@ This implementation provides a FastAPI POST endpoint `/update-data` that accepts
 
 ### 📋 Data Processing
 - **Structured Response**: Pydantic models for request/response validation
-- **Lead Processing**: Currently returns raw lead data (ready for downstream processing)
-- **Metadata**: Includes lead count, company name, and processing status
+- **Enhanced Lead Processing**: Groups leads by creator and assignee with natural language conversion
+- **Rich Metadata**: Includes creator names, assignee information, and grouping keys for advanced querying
 
 ## Implementation Details
 

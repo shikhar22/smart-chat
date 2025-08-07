@@ -12,6 +12,7 @@ import uvicorn
 from agent import BasicAIAgent
 from rag_agent import CompanyRAGAgent
 from firebase_client import fetch_company_leads, validate_firebase_company
+from lead_processor import process_leads_for_embedding, prepare_documents_for_vector_store, get_processing_summary
 
 # Pydantic models for request/response
 class QuestionRequest(BaseModel):
@@ -37,6 +38,15 @@ class UpdateDataRequest(BaseModel):
     """Request model for updating company data from Firebase."""
     company: str = Field(..., min_length=1, description="The name of the company to fetch data for")
 
+class ProcessedLeadsResponse(BaseModel):
+    """Response model for processed leads operation."""
+    status: str
+    message: str
+    company: str
+    total_leads: int
+    documents_ready_for_embedding: List[Dict[str, Any]]
+    processing_summary: Dict[str, Any]
+
 class UpdateDataResponse(BaseModel):
     """Response model for update data operation."""
     status: str
@@ -44,6 +54,9 @@ class UpdateDataResponse(BaseModel):
     company: str
     leads_count: int
     leads: List[Dict[str, Any]]
+    processed_leads: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    documents_ready_for_embedding: Optional[List[Dict[str, Any]]] = None
+    processing_summary: Optional[Dict[str, Any]] = None
 
 class QuestionResponse(BaseModel):
     """Response model for question answers."""
@@ -296,13 +309,13 @@ async def create_company_vectorstore(company_name: str, force_recreate: bool = F
 @app.post("/update-data", response_model=UpdateDataResponse)
 async def update_data(request: UpdateDataRequest):
     """
-    Update data for a specific company by fetching leads from Firebase.
+    Update data for a specific company by fetching leads from Firebase and processing them for embedding.
     
     Args:
         request: UpdateDataRequest containing the company name
         
     Returns:
-        UpdateDataResponse with fetched leads data
+        UpdateDataResponse with fetched leads data and processed documents ready for embedding
     """
     try:
         company_name = request.company
@@ -318,15 +331,25 @@ async def update_data(request: UpdateDataRequest):
         # Fetch leads from Firebase
         leads = fetch_company_leads(company_name)
         
-        # TODO: Add downstream processing here
-        # For now, we're just returning the fetched data
+        # Process leads for embedding - group by createdById and create documents
+        grouped_leads = process_leads_for_embedding(leads, company_name)
+        
+        # Prepare documents ready for vector store
+        documents_for_embedding = prepare_documents_for_vector_store(grouped_leads)
+        
+        # Get processing summary
+        summary = get_processing_summary(grouped_leads)
         
         return UpdateDataResponse(
             status="success",
-            message=f"Successfully fetched {len(leads)} leads for company '{company_name}'",
+            message=f"Successfully fetched and processed {len(leads)} leads for company '{company_name}'. "
+                   f"Created {len(documents_for_embedding)} documents grouped by {summary['total_groups']} creator-assignee combinations.",
             company=company_name,
             leads_count=len(leads),
-            leads=leads
+            leads=leads,
+            processed_leads=grouped_leads,
+            documents_ready_for_embedding=documents_for_embedding,
+            processing_summary=summary
         )
     
     except HTTPException:
@@ -334,6 +357,56 @@ async def update_data(request: UpdateDataRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating data for company '{request.company}': {str(e)}")
+
+@app.post("/process-leads", response_model=ProcessedLeadsResponse)
+async def process_leads(request: UpdateDataRequest):
+    """
+    Fetch leads from Firebase and return only processed documents ready for embedding.
+    
+    Args:
+        request: UpdateDataRequest containing the company name
+        
+    Returns:
+        ProcessedLeadsResponse with processed documents ready for embedding
+    """
+    try:
+        company_name = request.company
+        
+        # Validate that the company has Firebase configuration
+        if not validate_firebase_company(company_name):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Firebase configuration not found for company '{company_name}'. "
+                       f"Please ensure firebase_config/{company_name}.json exists."
+            )
+        
+        # Fetch leads from Firebase
+        leads = fetch_company_leads(company_name)
+        
+        # Process leads for embedding - group by createdById and create documents
+        grouped_leads = process_leads_for_embedding(leads, company_name)
+        
+        # Prepare documents ready for vector store
+        documents_for_embedding = prepare_documents_for_vector_store(grouped_leads)
+        
+        # Get processing summary
+        summary = get_processing_summary(grouped_leads)
+        
+        return ProcessedLeadsResponse(
+            status="success",
+            message=f"Successfully processed {len(leads)} leads for company '{company_name}'. "
+                   f"Created {len(documents_for_embedding)} documents grouped by {summary['total_groups']} creator-assignee combinations.",
+            company=company_name,
+            total_leads=len(leads),
+            documents_ready_for_embedding=documents_for_embedding,
+            processing_summary=summary
+        )
+    
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing leads for company '{request.company}': {str(e)}")
 
 @app.get("/models")
 async def list_available_models():

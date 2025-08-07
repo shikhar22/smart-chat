@@ -7,11 +7,12 @@ A comprehensive AI agent built with LangChain that supports both general Q&A and
 - **General AI Chat**: Basic question-answering using OpenAI models
 - **Company-Specific RAG**: Ask questions about specific companies using their knowledge base
 - **Firebase Integration**: Dynamic lead data fetching from company-specific Firebase projects
+- **Lead Processing**: Intelligent processing of leads grouped by creator with natural language conversion
 - **Multi-format Document Support**: PDF, DOCX, TXT, and JSON document ingestion
 - **Vector Search**: ChromaDB-powered semantic search
 - **REST API**: FastAPI-based API with comprehensive endpoints
 - **Interactive Testing**: Built-in test client and sample data
-- **Lead Data Processing**: Fetch and process lead collections from Firestore
+- **Lead Data Processing**: Fetch and process lead collections from Firestore with embedding-ready output
 
 ## Setup
 
@@ -140,21 +141,62 @@ streamlit run streamlit_app.py
 
 ### Firebase Lead Data Endpoints
 
-- **POST** `/update-data` - Fetch lead data from company-specific Firebase projects
+- **POST** `/update-data` - Fetch and process lead data from company-specific Firebase projects
   ```json
   {
     "company": "Kalco"
   }
   ```
   
-  Response:
+  Response (includes both raw and processed data):
   ```json
   {
     "status": "success",
-    "message": "Successfully fetched 2012 leads for company 'Kalco'",
+    "message": "Successfully fetched and processed 2012 leads for company 'Kalco'",
     "company": "Kalco",
     "leads_count": 2012,
-    "leads": [...]
+    "leads": [...],
+    "processed_leads": {
+      "user123": [...],
+      "user456": [...]
+    },
+    "documents_ready_for_embedding": [...],
+    "processing_summary": {
+      "total_leads_processed": 2012,
+      "total_creators": 5,
+      "leads_by_creator": {...}
+    }
+  }
+  ```
+
+- **POST** `/process-leads` - Process leads and return only documents ready for embedding
+  ```json
+  {
+    "company": "Kalco"
+  }
+  ```
+  
+  Response (optimized for embedding workflows):
+  ```json
+  {
+    "status": "success", 
+    "message": "Successfully processed 2012 leads for company 'Kalco'",
+    "company": "Kalco",
+    "total_leads": 2012,
+    "documents_ready_for_embedding": [
+      {
+        "id": "lead_001",
+        "text": "Lead from Kalco. Enquiry Date: January 15, 2025...",
+        "metadata": {
+          "company": "Kalco",
+          "leadId": "lead_001", 
+          "createdById": "user123",
+          "city": "Mumbai",
+          "updatedAt": "2025-01-20T10:30:00Z"
+        }
+      }
+    ],
+    "processing_summary": {...}
   }
   ```
 
@@ -281,14 +323,24 @@ With the provided sample companies, try these questions:
 - `agent.py` - Core AI agent class and CLI interface
 - `rag_agent.py` - RAG agent for company-specific Q&A
 - `main.py` - FastAPI REST API server with RAG endpoints
+- `lead_processor.py` - Lead processing and text flattening for embeddings
+- `firebase_client.py` - Firebase integration for fetching lead data
 - `streamlit_app.py` - Streamlit web interface
 - `setup_companies.py` - Script to set up sample company data
 - `test_rag_client.py` - Interactive test client for RAG functionality
+- `test_lead_processing.py` - Test suite for lead processing functionality
+- `example_lead_processing.py` - Examples and usage documentation
 - `requirements.txt` - Python dependencies (updated with RAG packages)
 - `setup.sh` - Setup script
 - `.env` - Environment variables (create this file)
 - `companies/` - Directory for company documents (auto-created)
 - `vectordb/` - Directory for vector databases (auto-created)
+- `firebase_config/` - Directory for Firebase service account keys
+
+### Documentation
+- `README.md` - Main project documentation
+- `FIREBASE_INTEGRATION.md` - Firebase setup and integration guide
+- `LEAD_PROCESSING.md` - Detailed lead processing implementation guide
 
 ## Quick Start Guide
 
