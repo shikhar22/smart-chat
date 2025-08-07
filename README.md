@@ -1,15 +1,17 @@
-# AI Chat Agent with RAG
+# AI Chat Agent with RAG & Firebase Integration
 
-A comprehensive AI agent built with LangChain that supports both general Q&A and company-specific knowledge retrieval using RAG (Retrieval Augmented Generation). Features include CLI interface, REST API endpoints via FastAPI, and company document management.
+A comprehensive AI agent built with LangChain that supports both general Q&A and company-specific knowledge retrieval using RAG (Retrieval Augmented Generation). Features include CLI interface, REST API endpoints via FastAPI, company document management, and Firebase integration for lead data processing.
 
 ## Features
 
 - **General AI Chat**: Basic question-answering using OpenAI models
 - **Company-Specific RAG**: Ask questions about specific companies using their knowledge base
+- **Firebase Integration**: Dynamic lead data fetching from company-specific Firebase projects
 - **Multi-format Document Support**: PDF, DOCX, TXT, and JSON document ingestion
 - **Vector Search**: ChromaDB-powered semantic search
 - **REST API**: FastAPI-based API with comprehensive endpoints
 - **Interactive Testing**: Built-in test client and sample data
+- **Lead Data Processing**: Fetch and process lead collections from Firestore
 
 ## Setup
 
@@ -28,6 +30,12 @@ pip install -r requirements.txt
 ```
 OPENAI_API_KEY=your_openai_api_key_here
 ```
+
+4. **Firebase Setup** (for lead data integration):
+   - Create Firebase projects for each company
+   - Generate service account keys
+   - Place JSON files in `firebase_config/` directory
+   - See [Firebase Integration Guide](FIREBASE_INTEGRATION.md) for detailed setup
 
 4. Set up sample company data (optional):
 ```bash
@@ -128,6 +136,26 @@ streamlit run streamlit_app.py
 - **POST** `/create-company-vectorstore/{company_name}` - Create/recreate vector store
   ```bash
   curl -X POST "http://localhost:8008/create-company-vectorstore/TechCorp?force_recreate=true"
+  ```
+
+### Firebase Lead Data Endpoints
+
+- **POST** `/update-data` - Fetch lead data from company-specific Firebase projects
+  ```json
+  {
+    "company": "Kalco"
+  }
+  ```
+  
+  Response:
+  ```json
+  {
+    "status": "success",
+    "message": "Successfully fetched 2012 leads for company 'Kalco'",
+    "company": "Kalco",
+    "leads_count": 2012,
+    "leads": [...]
+  }
   ```
 
 ### Models

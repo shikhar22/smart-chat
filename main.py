@@ -7,10 +7,11 @@ Provides REST API endpoints to interact with the AI agent.
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uvicorn
 from agent import BasicAIAgent
 from rag_agent import CompanyRAGAgent
+from firebase_client import fetch_company_leads, validate_firebase_company
 
 # Pydantic models for request/response
 class QuestionRequest(BaseModel):
@@ -31,6 +32,18 @@ class AddDocumentRequest(BaseModel):
     company_name: str = Field(..., min_length=1, description="The name of the company")
     content: str = Field(..., min_length=1, description="The content of the document")
     filename: str = Field(..., min_length=1, description="The filename for the document")
+
+class UpdateDataRequest(BaseModel):
+    """Request model for updating company data from Firebase."""
+    company: str = Field(..., min_length=1, description="The name of the company to fetch data for")
+
+class UpdateDataResponse(BaseModel):
+    """Response model for update data operation."""
+    status: str
+    message: str
+    company: str
+    leads_count: int
+    leads: List[Dict[str, Any]]
 
 class QuestionResponse(BaseModel):
     """Response model for question answers."""
@@ -279,6 +292,48 @@ async def create_company_vectorstore(company_name: str, force_recreate: bool = F
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating vector store: {str(e)}")
+
+@app.post("/update-data", response_model=UpdateDataResponse)
+async def update_data(request: UpdateDataRequest):
+    """
+    Update data for a specific company by fetching leads from Firebase.
+    
+    Args:
+        request: UpdateDataRequest containing the company name
+        
+    Returns:
+        UpdateDataResponse with fetched leads data
+    """
+    try:
+        company_name = request.company
+        
+        # Validate that the company has Firebase configuration
+        if not validate_firebase_company(company_name):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Firebase configuration not found for company '{company_name}'. "
+                       f"Please ensure firebase_config/{company_name}.json exists."
+            )
+        
+        # Fetch leads from Firebase
+        leads = fetch_company_leads(company_name)
+        
+        # TODO: Add downstream processing here
+        # For now, we're just returning the fetched data
+        
+        return UpdateDataResponse(
+            status="success",
+            message=f"Successfully fetched {len(leads)} leads for company '{company_name}'",
+            company=company_name,
+            leads_count=len(leads),
+            leads=leads
+        )
+    
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating data for company '{request.company}': {str(e)}")
 
 @app.get("/models")
 async def list_available_models():

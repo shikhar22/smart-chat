@@ -42,5 +42,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Firebase configuration (exclude actual service account keys)
+firebase_config/*.json
+!firebase_config/README.md
+
 /companies
 /vectordb

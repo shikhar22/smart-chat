@@ -11,3 +11,4 @@ langchain-chroma==0.1.4
 pypdf==3.17.4
 docx2txt==0.8
 requests==2.31.0
+firebase-admin==6.5.0
