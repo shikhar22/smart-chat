@@ -35,8 +35,6 @@ logger = logging.getLogger(__name__)
 # Initialize OpenAI client with graceful handling
 try:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    print("Success!!!!!")
-    print(client)
 except Exception as e:
     logger.warning(f"OpenAI client initialization warning: {e}")
     client = None
@@ -218,7 +216,7 @@ async def ask_question(request: AskRequest):
         
         # Step 1 & 2: Search vector store
         vector_store_name = getVectorStoreName(request.companyName)
-        search_results = search_vector_store(request.companyName, request.question, top_k=10)
+        search_results = search_vector_store(request.companyName, request.question, top_k=20)
         
         if not search_results:
             logger.warning(f"No search results found for {request.companyName}")

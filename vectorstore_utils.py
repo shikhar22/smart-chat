@@ -70,7 +70,7 @@ def fetch_existing_metadata_map(company_name: str) -> Dict[str, str]:
         vector_store_name = getVectorStoreName(company_name)
         
         # Try to find existing vector store
-        vector_stores = client.vector_stores.list()
+        vector_stores = client.beta.vector_stores.list()
         target_store = None
         
         for store in vector_stores.data:
@@ -154,7 +154,7 @@ def upsert_lead_documents(company_name: str, items: List[Dict[str, Any]]) -> dic
         vector_store_name = getVectorStoreName(company_name)
         
         # Find or create vector store
-        vector_stores = client.vector_stores.list()
+        vector_stores = client.beta.vector_stores.list()
         target_store = None
         
         for store in vector_stores.data:
@@ -164,7 +164,7 @@ def upsert_lead_documents(company_name: str, items: List[Dict[str, Any]]) -> dic
         
         if not target_store:
             logger.info(f"Creating new vector store: {vector_store_name}")
-            target_store = client.vector_stores.create(
+            target_store = client.beta.vector_stores.create(
                 name=vector_store_name,
                 metadata={"company": company_name}
             )
@@ -214,7 +214,7 @@ Metadata: {item['metadata']}"""
             # Add files to vector store in a batch
             if file_objects:
                 try:
-                    file_batch = client.vector_stores.file_batches.create(
+                    file_batch = client.beta.vector_stores.file_batches.create(
                         vector_store_id=target_store.id,
                         file_ids=[f.id for f in file_objects]
                     )
@@ -226,7 +226,7 @@ Metadata: {item['metadata']}"""
                     while file_batch.status in ["in_progress", "queued"] and wait_time < max_wait:
                         time.sleep(3)
                         wait_time += 3
-                        file_batch = client.vector_stores.file_batches.retrieve(
+                        file_batch = client.beta.vector_stores.file_batches.retrieve(
                             vector_store_id=target_store.id,
                             batch_id=file_batch.id
                         )
@@ -276,7 +276,7 @@ def delete_vectors_by_filter(company_name: str, assigned_to: str = None, assigne
         vector_store_name = getVectorStoreName(company_name)
         
         # Find vector store
-        vector_stores = client.vector_stores.list()
+        vector_stores = client.beta.vector_stores.list()
         target_store = None
         
         for store in vector_stores.data:
@@ -289,7 +289,7 @@ def delete_vectors_by_filter(company_name: str, assigned_to: str = None, assigne
         
         # If full refresh (no filters), delete the entire vector store and recreate
         if not assigned_to and not assigned_to_id:
-            client.vector_stores.delete(target_store.id)
+            client.beta.vector_stores.delete(target_store.id)
             logger.info(f"Deleted vector store for {company_name}")
             return {"deleted": "all", "message": f"Deleted entire vector store for {company_name}"}
         
@@ -319,7 +319,7 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
         vector_store_name = getVectorStoreName(company_name)
         
         # Find vector store
-        vector_stores = client.vector_stores.list()
+        vector_stores = client.beta.vector_stores.list()
         target_store = None
         
         for store in vector_stores.data:
@@ -332,7 +332,7 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
             return []
         
         # Create a temporary assistant for search
-        assistant = client.assistants.create(
+        assistant = client.beta.assistants.create(
             name=f"Search Assistant for {company_name}",
             instructions=f"You are a search assistant for {company_name} leads. Find and return relevant lead information based on the user's query. Always include specific lead details like Lead ID, project information, and contact details when available.",
             model="gpt-4o-mini",  # Use a more cost-effective model for search
@@ -342,17 +342,17 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
         
         try:
             # Create a thread and run search
-            thread = client.threads.create()
+            thread = client.beta.threads.create()
             
             # Send the search query
-            client.threads.messages.create(
+            client.beta.threads.messages.create(
                 thread_id=thread.id,
                 role="user",
                 content=f"Search for leads related to: {query}. Return the top {top_k} most relevant leads with their details."
             )
             
             # Run the assistant
-            run = client.threads.runs.create(
+            run = client.beta.threads.runs.create(
                 thread_id=thread.id,
                 assistant_id=assistant.id
             )
@@ -363,11 +363,11 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
             while run.status in ["queued", "in_progress"] and wait_time < max_wait:
                 time.sleep(1)
                 wait_time += 1
-                run = client.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+                run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             
             if run.status == "completed":
                 # Get the assistant's response
-                messages = client.threads.messages.list(thread_id=thread.id)
+                messages = client.beta.threads.messages.list(thread_id=thread.id)
                 
                 # Find the assistant's response
                 assistant_message = None
@@ -405,8 +405,8 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
         finally:
             # Clean up resources
             try:
-                client.threads.delete(thread.id)
-                client.assistants.delete(assistant.id)
+                client.beta.threads.delete(thread.id)
+                client.beta.assistants.delete(assistant.id)
             except Exception as cleanup_e:
                 logger.warning(f"Error cleaning up search resources: {cleanup_e}")
         
