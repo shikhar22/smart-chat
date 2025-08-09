@@ -31,7 +31,7 @@ The lead processing system has been enhanced to support both **creator** and **a
   "text": "Lead from Kalco. Enquiry Date: January 15, 2025. City: Mumbai... Assigned To: Jane Smith. Created By: John Doe.",
   "metadata": {
     "company": "Kalco",
-    "leadId": "lead_12345",
+    "id": "lead_12345",
     "createdById": "user123",
     "createdBy": "John Doe",        // NEW
     "assignedToId": "agent456",     // NEW  

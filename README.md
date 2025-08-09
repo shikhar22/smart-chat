@@ -189,7 +189,7 @@ streamlit run streamlit_app.py
         "text": "Lead from Kalco. Enquiry Date: January 15, 2025...",
         "metadata": {
           "company": "Kalco",
-          "leadId": "lead_001", 
+          "id": "lead_001", 
           "createdById": "user123",
           "city": "Mumbai",
           "updatedAt": "2025-01-20T10:30:00Z"

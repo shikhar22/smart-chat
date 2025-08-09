@@ -1,448 +1,335 @@
 #!/usr/bin/env python3
 """
-FastAPI application for AI Chat Agent
-Provides REST API endpoints to interact with the AI agent.
+FastAPI application for semantic RAG pipeline with lead processing.
+Provides exactly two endpoints: /update-leads and /ask.
 """
 
+import logging
+import os
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
 import uvicorn
-from agent import BasicAIAgent
-from rag_agent import CompanyRAGAgent
-from firebase_client import fetch_company_leads, validate_firebase_company
-from lead_processor import process_leads_for_embedding, prepare_documents_for_vector_store, get_processing_summary
+from openai import OpenAI
+
+# Import our utility modules
+from firebase_utils import init_firebase_app, fetch_all_leads
+from flatten_utils import flattenLeadToText
+from vectorstore_utils import (
+    getVectorStoreName, 
+    fetch_existing_metadata_map, 
+    embed_texts, 
+    upsert_lead_documents,
+    delete_vectors_by_filter,
+    search_vector_store
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize OpenAI client with graceful handling
+try:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    print("Success!!!!!")
+    print(client)
+except Exception as e:
+    logger.warning(f"OpenAI client initialization warning: {e}")
+    client = None
 
 # Pydantic models for request/response
-class QuestionRequest(BaseModel):
-    """Request model for asking a question."""
-    question: str = Field(..., min_length=1, description="The question to ask the AI agent")
-    model_name: Optional[str] = Field("gpt-3.5-turbo", description="OpenAI model to use")
-    temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0, description="Temperature for response randomness")
+class UpdateLeadsRequest(BaseModel):
+    """Request model for updating leads in vector store."""
+    companyName: str = Field(..., min_length=1, description="The name of the company")
+    assignedTo: Optional[str] = Field(None, description="Filter by assigned to name")
+    assignedToId: Optional[str] = Field(None, description="Filter by assigned to ID") 
+    forceRefresh: bool = Field(False, description="Force refresh all leads")
 
-class CompanyQuestionRequest(BaseModel):
-    """Request model for asking a company-specific question using RAG."""
-    question: str = Field(..., min_length=1, description="The question to ask about the company")
-    company_name: str = Field(..., min_length=1, description="The name of the company to ask about")
-    model_name: Optional[str] = Field("gpt-3.5-turbo", description="OpenAI model to use")
-    temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0, description="Temperature for response randomness")
+class UpdateLeadsResponse(BaseModel):
+    """Response model for update leads operation."""
+    companyName: str
+    totalLeadsFetched: int
+    totalUpserted: int
+    totalSkipped: int
 
-class AddDocumentRequest(BaseModel):
-    """Request model for adding a company document."""
-    company_name: str = Field(..., min_length=1, description="The name of the company")
-    content: str = Field(..., min_length=1, description="The content of the document")
-    filename: str = Field(..., min_length=1, description="The filename for the document")
+class AskRequest(BaseModel):
+    """Request model for asking questions using RAG."""
+    companyName: str = Field(..., min_length=1, description="The name of the company")
+    question: str = Field(..., min_length=1, description="The natural language question")
 
-class UpdateDataRequest(BaseModel):
-    """Request model for updating company data from Firebase."""
-    company: str = Field(..., min_length=1, description="The name of the company to fetch data for")
-
-class ProcessedLeadsResponse(BaseModel):
-    """Response model for processed leads operation."""
-    status: str
-    message: str
-    company: str
-    total_leads: int
-    documents_ready_for_embedding: List[Dict[str, Any]]
-    processing_summary: Dict[str, Any]
-
-class UpdateDataResponse(BaseModel):
-    """Response model for update data operation."""
-    status: str
-    message: str
-    company: str
-    leads_count: int
-    leads: List[Dict[str, Any]]
-    processed_leads: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    documents_ready_for_embedding: Optional[List[Dict[str, Any]]] = None
-    processing_summary: Optional[Dict[str, Any]] = None
-
-class QuestionResponse(BaseModel):
-    """Response model for question answers."""
-    question: str
+class AskResponse(BaseModel):
+    """Response model for ask operation."""
     answer: str
-    model_used: str
-    temperature: float
-
-class CompanyQuestionResponse(BaseModel):
-    """Response model for company-specific question answers."""
-    question: str
-    answer: str
-    company_name: str
-    model_used: str
-    temperature: float
-
-class HealthResponse(BaseModel):
-    """Response model for health check."""
-    status: str
-    message: str
-
-class CompaniesResponse(BaseModel):
-    """Response model for listing companies."""
-    companies: List[str]
-    count: int
+    sources: List[Dict[str, Any]]
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="AI Chat Agent API",
-    description="A REST API for interacting with an AI chat agent powered by LangChain and OpenAI",
+    title="Semantic RAG Pipeline API",
+    description="API for lead processing and semantic question answering",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# Add CORS middleware to allow cross-origin requests
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global agent instances
-agent_instance = None
-rag_agent_instance = None
-
-def get_agent(model_name: str = "gpt-3.5-turbo", temperature: float = 0.7) -> BasicAIAgent:
-    """Get or create an AI agent instance."""
-    global agent_instance
+@app.post("/update-leads", response_model=UpdateLeadsResponse)
+async def update_leads(request: UpdateLeadsRequest):
+    """
+    Fetch leads from company-specific Firebase, flatten, embed, and upsert to OpenAI Vector Store.
+    
+    Steps:
+    1. Initialize Firebase app for the company
+    2. Fetch all leads from Firebase
+    3. Optionally filter leads by assignedTo/assignedToId
+    4. Check existing metadata to determine which leads need updating
+    5. Flatten leads to text and prepare for embedding
+    6. Batch embed and upsert to vector store
+    7. Return summary
+    """
     try:
-        # Create new agent if parameters changed or no agent exists
-        if (agent_instance is None or 
-            getattr(agent_instance, 'model_name', None) != model_name or
-            getattr(agent_instance.llm, 'temperature', None) != temperature):
-            agent_instance = BasicAIAgent(model_name=model_name, temperature=temperature)
-            # Store model name for comparison
-            agent_instance.model_name = model_name
-        return agent_instance
+        logger.info(f"Processing update-leads request for company: {request.companyName}")
+        
+        # Step 1: Initialize Firebase app
+        init_firebase_app(request.companyName)
+        
+        # Step 2: Fetch all leads
+        leads = fetch_all_leads(request.companyName)
+        total_leads_fetched = len(leads)
+        
+        logger.info(f"Fetched {total_leads_fetched} leads for {request.companyName}")
+        
+        # Step 3: Filter leads if assignedTo or assignedToId provided
+        if request.assignedTo or request.assignedToId:
+            filtered_leads = []
+            for lead in leads:
+                assigned_to_match = True
+                assigned_to_id_match = True
+                
+                if request.assignedTo:
+                    assigned_to_match = lead.get('assignedTo') == request.assignedTo
+                
+                if request.assignedToId:
+                    assigned_to_id_match = lead.get('assignedToId') == request.assignedToId
+                
+                if assigned_to_match and assigned_to_id_match:
+                    filtered_leads.append(lead)
+            
+            leads = filtered_leads
+            logger.info(f"Filtered to {len(leads)} leads based on assignedTo/assignedToId")
+        
+        # Step 4: Check existing metadata to determine updates needed
+        existing_map = fetch_existing_metadata_map(request.companyName) if not request.forceRefresh else {}
+        
+        leads_to_upsert = []
+        for lead in leads:
+            lead_id = lead.get('id')
+            updated_at = lead.get('updatedAt')
+            
+            if (lead_id not in existing_map or 
+                updated_at != existing_map.get(lead_id) or 
+                request.forceRefresh):
+                leads_to_upsert.append(lead)
+        
+        total_skipped = len(leads) - len(leads_to_upsert)
+        logger.info(f"Need to upsert {len(leads_to_upsert)} leads, skipping {total_skipped}")
+        
+        # Step 5: Prepare items for embedding and upserting
+        items = []
+        for lead in leads_to_upsert:
+            try:
+                # Flatten lead to text
+                text = flattenLeadToText(lead, request.companyName)
+                
+                # Prepare metadata in camelCase
+                metadata = {
+                    "companyName": request.companyName,
+                    "assignedTo": lead.get('assignedTo', ''),
+                    "assignedToId": lead.get('assignedToId', ''),
+                    "updatedAt": lead.get('updatedAt', ''),
+                    "projectCity": lead.get('projectCity', ''),
+                    "projectCategory": lead.get('projectCategory', ''),
+                    "id": lead.get('id', ''),
+                    "generatedAt": lead.get('generatedAt', ''),
+                    "projectStage": lead.get('projectStage', ''),
+                    "projectSource": lead.get('projectSource', '')
+                }
+                
+                # Remove empty values from metadata
+                metadata = {k: v for k, v in metadata.items() if v}
+                
+                items.append({
+                    "id": lead.get('id', ''),
+                    "text": text,
+                    "metadata": metadata
+                })
+                
+            except Exception as e:
+                logger.warning(f"Error processing lead {lead.get('id', 'unknown')}: {e}")
+                continue
+        
+        # Step 6: Upsert to vector store
+        total_upserted = 0
+        if items:
+            upsert_result = upsert_lead_documents(request.companyName, items)
+            total_upserted = upsert_result.get('upserted', 0)
+            logger.info(f"Upserted {total_upserted} leads to vector store")
+        
+        # Step 7: Return summary
+        return UpdateLeadsResponse(
+            companyName=request.companyName,
+            totalLeadsFetched=total_leads_fetched,
+            totalUpserted=total_upserted,
+            totalSkipped=total_skipped
+        )
+        
+    except FileNotFoundError as e:
+        logger.error(f"Firebase configuration not found: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize AI agent: {str(e)}")
+        logger.error(f"Error in update-leads: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-def get_rag_agent(model_name: str = "gpt-3.5-turbo", temperature: float = 0.7) -> CompanyRAGAgent:
-    """Get or create a RAG agent instance."""
-    global rag_agent_instance
+@app.post("/ask", response_model=AskResponse)
+async def ask_question(request: AskRequest):
+    """
+    Retrieve top 10 semantically relevant lead docs and answer using GPT-4o (RAG).
+    
+    Steps:
+    1. Get vector store name for the company
+    2. Search vector store for semantically similar documents
+    3. Build RAG prompt with retrieved documents
+    4. Call GPT-4o with the RAG prompt
+    5. Return answer and sources
+    """
     try:
-        # Create new agent if parameters changed or no agent exists
-        if (rag_agent_instance is None or 
-            getattr(rag_agent_instance.llm, 'model_name', None) != model_name or
-            getattr(rag_agent_instance.llm, 'temperature', None) != temperature):
-            rag_agent_instance = CompanyRAGAgent(model_name=model_name, temperature=temperature)
-        return rag_agent_instance
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize RAG agent: {str(e)}")
+        logger.info(f"Processing ask request for company: {request.companyName}")
+        
+        # Step 1 & 2: Search vector store
+        vector_store_name = getVectorStoreName(request.companyName)
+        search_results = search_vector_store(request.companyName, request.question, top_k=10)
+        
+        if not search_results:
+            logger.warning(f"No search results found for {request.companyName}")
+            return AskResponse(
+                answer="I don't have any lead data available for this company in the vector store. Please ensure leads have been processed using the /update-leads endpoint first.",
+                sources=[]
+            )
+        
+        # Step 3: Build RAG prompt
+        docs_context = []
+        sources = []
+        
+        for i, result in enumerate(search_results[:10]):
+            metadata = result.get('metadata', {})
+            content = result.get('content', '')
+            
+            # Extract key metadata for display
+            lead_id = metadata.get('id', f'doc_{i}')
+            project_city = metadata.get('projectCity', 'Unknown')
+            updated_at = metadata.get('updatedAt', 'Unknown')
+            
+            doc_summary = f"Lead ID: {lead_id}, City: {project_city}, Updated: {updated_at}"
+            docs_context.append(f"Document {i+1}: {doc_summary}\nContent: {content}\n")
+            
+            sources.append({
+                "id": lead_id,
+                "score": result.get('score', 0.0),
+                "metadata": metadata,
+                "snippet": content[:200] + "..." if len(content) > 200 else content
+            })
+        
+        rag_prompt = f"""You are a sales analyst. User question: {request.question}
 
-@app.get("/", response_model=HealthResponse)
+Here are the top relevant leads (metadata + content):
+
+{''.join(docs_context)}
+
+Please answer the user's question concisely and include numeric comparisons (e.g., % change, counts) where applicable. If specific data is missing, say so clearly. 
+
+Structure your response with these sections when relevant:
+- Lead Volume & Trends
+- Engagement & Follow-ups  
+- Source & Quality
+- Stakeholder Activity
+- Smart Observations
+- Final Summary with actionable recommendations
+
+Focus on being analytical and data-driven in your response."""
+        
+        # Step 4: Call GPT-4o
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a helpful sales analyst assistant."},
+                    {"role": "user", "content": rag_prompt}
+                ],
+                temperature=0.3,  # Lower temperature for more consistent analytical responses
+                max_tokens=1500
+            )
+            
+            answer = response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"Error calling GPT-4o: {e}")
+            # Fallback to GPT-3.5-turbo if GPT-4o fails
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful sales analyst assistant."},
+                        {"role": "user", "content": rag_prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=1500
+                )
+                answer = response.choices[0].message.content
+            except Exception as fallback_e:
+                logger.error(f"Error with fallback model: {fallback_e}")
+                raise HTTPException(status_code=500, detail="Error generating response from AI model")
+        
+        # Step 5: Return response
+        return AskResponse(
+            answer=answer,
+            sources=sources
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in ask endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/")
 async def root():
     """Root endpoint - health check."""
-    return HealthResponse(
-        status="healthy",
-        message="AI Chat Agent API is running! Visit /docs for API documentation."
-    )
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint."""
-    return HealthResponse(
-        status="healthy",
-        message="AI Chat Agent API is operational"
-    )
-
-@app.post("/ask", response_model=QuestionResponse)
-async def ask_question(request: QuestionRequest):
-    """
-    Ask the AI agent a question.
-    
-    Args:
-        request: QuestionRequest containing the question and optional parameters
-        
-    Returns:
-        QuestionResponse with the AI's answer
-    """
-    try:
-        # Get or create agent with specified parameters
-        agent = get_agent(model_name=request.model_name, temperature=request.temperature)
-        
-        # Get response from agent
-        answer = agent.ask_question(request.question)
-        
-        return QuestionResponse(
-            question=request.question,
-            answer=answer,
-            model_used=request.model_name,
-            temperature=request.temperature
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
-
-@app.post("/chat")
-async def chat_endpoint(request: QuestionRequest):
-    """
-    Alternative chat endpoint with simpler response format.
-    
-    Args:
-        request: QuestionRequest containing the question and optional parameters
-        
-    Returns:
-        Simple JSON response with the answer
-    """
-    try:
-        agent = get_agent(model_name=request.model_name, temperature=request.temperature)
-        answer = agent.ask_question(request.question)
-        
-        return {
-            "response": answer,
-            "status": "success"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
-
-@app.post("/ask-company", response_model=CompanyQuestionResponse)
-async def ask_company_question(request: CompanyQuestionRequest):
-    """
-    Ask a question about a specific company using RAG.
-    
-    Args:
-        request: CompanyQuestionRequest containing the question, company name and optional parameters
-        
-    Returns:
-        CompanyQuestionResponse with the AI's answer based on company documents
-    """
-    try:
-        # Get or create RAG agent with specified parameters
-        rag_agent = get_rag_agent(model_name=request.model_name, temperature=request.temperature)
-        
-        # Get response from RAG agent
-        answer = rag_agent.ask_company_question(request.question, request.company_name)
-        
-        return CompanyQuestionResponse(
-            question=request.question,
-            answer=answer,
-            company_name=request.company_name,
-            model_used=request.model_name,
-            temperature=request.temperature
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing company question: {str(e)}")
-
-@app.get("/companies", response_model=CompaniesResponse)
-async def list_companies():
-    """
-    List all available companies in the knowledge base.
-    
-    Returns:
-        CompaniesResponse with list of company names
-    """
-    try:
-        rag_agent = get_rag_agent()
-        companies = rag_agent.list_available_companies()
-        
-        return CompaniesResponse(
-            companies=companies,
-            count=len(companies)
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing companies: {str(e)}")
-
-@app.post("/add-company-document")
-async def add_company_document(request: AddDocumentRequest):
-    """
-    Add a document for a specific company to the knowledge base.
-    
-    Args:
-        request: AddDocumentRequest containing company name, content, and filename
-        
-    Returns:
-        Success message
-    """
-    try:
-        rag_agent = get_rag_agent()
-        rag_agent.add_company_document(
-            company_name=request.company_name,
-            content=request.content,
-            filename=request.filename
-        )
-        
-        return {
-            "status": "success",
-            "message": f"Document '{request.filename}' added for company '{request.company_name}'"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding document: {str(e)}")
-
-@app.post("/create-company-vectorstore/{company_name}")
-async def create_company_vectorstore(company_name: str, force_recreate: bool = False):
-    """
-    Create or recreate vector store for a specific company.
-    
-    Args:
-        company_name: Name of the company
-        force_recreate: Whether to force recreation of existing vector store
-        
-    Returns:
-        Success message
-    """
-    try:
-        rag_agent = get_rag_agent()
-        rag_agent.create_company_vectorstore(company_name, force_recreate=force_recreate)
-        
-        return {
-            "status": "success",
-            "message": f"Vector store created for company '{company_name}'"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating vector store: {str(e)}")
-
-@app.post("/update-data", response_model=UpdateDataResponse)
-async def update_data(request: UpdateDataRequest):
-    """
-    Update data for a specific company by fetching leads from Firebase and processing them for embedding.
-    
-    Args:
-        request: UpdateDataRequest containing the company name
-        
-    Returns:
-        UpdateDataResponse with fetched leads data and processed documents ready for embedding
-    """
-    try:
-        company_name = request.company
-        
-        # Validate that the company has Firebase configuration
-        if not validate_firebase_company(company_name):
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Firebase configuration not found for company '{company_name}'. "
-                       f"Please ensure firebase_config/{company_name}.json exists."
-            )
-        
-        # Fetch leads from Firebase
-        leads = fetch_company_leads(company_name)
-        
-        # Process leads for embedding - group by createdById and create documents
-        grouped_leads = process_leads_for_embedding(leads, company_name)
-        
-        # Prepare documents ready for vector store
-        documents_for_embedding = prepare_documents_for_vector_store(grouped_leads)
-        
-        # Get processing summary
-        summary = get_processing_summary(grouped_leads)
-        
-        return UpdateDataResponse(
-            status="success",
-            message=f"Successfully fetched and processed {len(leads)} leads for company '{company_name}'. "
-                   f"Created {len(documents_for_embedding)} documents grouped by {summary['total_groups']} creator-assignee combinations.",
-            company=company_name,
-            leads_count=len(leads),
-            leads=leads,
-            processed_leads=grouped_leads,
-            documents_ready_for_embedding=documents_for_embedding,
-            processing_summary=summary
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating data for company '{request.company}': {str(e)}")
-
-@app.post("/process-leads", response_model=ProcessedLeadsResponse)
-async def process_leads(request: UpdateDataRequest):
-    """
-    Fetch leads from Firebase and return only processed documents ready for embedding.
-    
-    Args:
-        request: UpdateDataRequest containing the company name
-        
-    Returns:
-        ProcessedLeadsResponse with processed documents ready for embedding
-    """
-    try:
-        company_name = request.company
-        
-        # Validate that the company has Firebase configuration
-        if not validate_firebase_company(company_name):
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Firebase configuration not found for company '{company_name}'. "
-                       f"Please ensure firebase_config/{company_name}.json exists."
-            )
-        
-        # Fetch leads from Firebase
-        leads = fetch_company_leads(company_name)
-        
-        # Process leads for embedding - group by createdById and create documents
-        grouped_leads = process_leads_for_embedding(leads, company_name)
-        
-        # Prepare documents ready for vector store
-        documents_for_embedding = prepare_documents_for_vector_store(grouped_leads)
-        
-        # Get processing summary
-        summary = get_processing_summary(grouped_leads)
-        
-        return ProcessedLeadsResponse(
-            status="success",
-            message=f"Successfully processed {len(leads)} leads for company '{company_name}'. "
-                   f"Created {len(documents_for_embedding)} documents grouped by {summary['total_groups']} creator-assignee combinations.",
-            company=company_name,
-            total_leads=len(leads),
-            documents_ready_for_embedding=documents_for_embedding,
-            processing_summary=summary
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing leads for company '{request.company}': {str(e)}")
-
-@app.get("/models")
-async def list_available_models():
-    """
-    List available OpenAI models that can be used.
-    
-    Returns:
-        List of available model names and API capabilities
-    """
-    available_models = [
-        "gpt-3.5-turbo",
-        "gpt-3.5-turbo-16k",
-        "gpt-4",
-        "gpt-4-turbo-preview",
-        "gpt-4o",
-        "gpt-4o-mini"
-    ]
-    
     return {
-        "available_models": available_models,
-        "default_model": "gpt-3.5-turbo",
-        "note": "Model availability depends on your OpenAI API access level",
-        "features": {
-            "basic_chat": "Available via /ask and /chat endpoints",
-            "company_rag": "Company-specific Q&A via /ask-company endpoint",
-            "document_management": "Add company documents via /add-company-document endpoint",
-            "company_listing": "List available companies via /companies endpoint"
-        }
+        "message": "Semantic RAG Pipeline API is running",
+        "endpoints": ["/update-leads", "/ask"],
+        "docs": "/docs"
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "message": "API is operational"}
+
 if __name__ == "__main__":
-    # Run the FastAPI application
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8008,
-        reload=True,  # Enable auto-reload during development
-        log_level="info"
-    )
+    # Check for required environment variables
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("OPENAI_API_KEY environment variable is required")
+        exit(1)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8008)

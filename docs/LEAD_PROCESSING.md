@@ -29,7 +29,7 @@ Each processed document has:
   "text": "Lead from Kalco. Enquiry Date: January 15, 2025...",
   "metadata": {
     "company": "Kalco",
-    "leadId": "lead_12345", 
+    "id": "lead_12345", 
     "createdById": "user123",
     "createdBy": "John Doe",
     "assignedToId": "agent456",

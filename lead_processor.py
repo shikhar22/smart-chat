@@ -27,7 +27,7 @@ def flatten_lead_to_text(lead: dict, company: str) -> str:
     # Priority fields to extract and their display names
     priority_fields = [
         # Field path, display name
-        ("enquiryDate", "Enquiry Date"),
+        ("generatedAt", "Enquiry Date"),
         ("clientDetails.city", "City"),
         ("projectStage", "Project Stage"),
         ("clientDetails.name", "Client Name"),
@@ -152,7 +152,7 @@ def process_leads_for_embedding(leads: List[Dict[str, Any]], company: str) -> Di
         assigned_to = lead.get('assignedTo', '')
         
         # Get other metadata
-        lead_id = lead.get('id', lead.get('leadId', ''))
+        lead_id = lead.get('id', lead.get('id', ''))
         city = ""
         updated_at = lead.get('updatedAt', lead.get('updated_at', ''))
         
@@ -174,7 +174,7 @@ def process_leads_for_embedding(leads: List[Dict[str, Any]], company: str) -> Di
             'text': flattened_text,
             'metadata': {
                 'company': company,
-                'leadId': lead_id,
+                'id': lead_id,
                 'createdById': created_by_id,
                 'createdBy': created_by,
                 'assignedToId': assigned_to_id,

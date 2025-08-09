@@ -16,7 +16,7 @@
 
 ### 3. Document Preparation
 - ✅ **Document structure** with `id`, `text`, and `metadata`
-- ✅ **Metadata includes**: `company`, `leadId`, `createdById`, `city`, `updatedAt`
+- ✅ **Metadata includes**: `company`, `id`, `createdById`, `city`, `updatedAt`
 - ✅ **Ready for embedding/upsertion** with standardized format
 
 ## 📁 Files Created/Modified
@@ -99,7 +99,7 @@
       "text": "Lead from Kalco. Enquiry Date: January 15, 2025. City: Mumbai...",
       "metadata": {
         "company": "Kalco",
-        "leadId": "lead_001",
+        "id": "lead_001",
         "createdById": "user123", 
         "city": "Mumbai",
         "updatedAt": "2025-01-20T10:30:00Z"
