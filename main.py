@@ -1,320 +1,362 @@
 #!/usr/bin/env python3
 """
-FastAPI application for AI Chat Agent
-Provides REST API endpoints to interact with the AI agent.
+FastAPI application for semantic RAG pipeline with lead processing.
+Provides exactly two endpoints: /update-leads and /ask.
 """
 
+import logging
+import os
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
 import uvicorn
-from agent import BasicAIAgent
-from rag_agent import CompanyRAGAgent
+from openai import OpenAI
+
+# Import our utility modules
+from firebase_utils import init_firebase_app, fetch_all_leads
+from chunking_utils import group_leads_by_assignee, create_chunked_documents
+from vectorstore_utils import (
+    getVectorStoreName, 
+    upsert_chunked_documents,
+    delete_vectors_by_filter,
+    search_vector_store
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize OpenAI client with graceful handling
+try:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception as e:
+    logger.warning(f"OpenAI client initialization warning: {e}")
+    client = None
 
 # Pydantic models for request/response
-class QuestionRequest(BaseModel):
-    """Request model for asking a question."""
-    question: str = Field(..., min_length=1, description="The question to ask the AI agent")
-    model_name: Optional[str] = Field("gpt-3.5-turbo", description="OpenAI model to use")
-    temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0, description="Temperature for response randomness")
+class UpdateLeadsRequest(BaseModel):
+    """Request model for updating leads in vector store."""
+    companyName: str = Field(..., min_length=1, description="The name of the company")
+    assignedTo: Optional[str] = Field(None, description="Filter by assigned to name")
+    assignedToId: Optional[str] = Field(None, description="Filter by assigned to ID")
 
-class CompanyQuestionRequest(BaseModel):
-    """Request model for asking a company-specific question using RAG."""
-    question: str = Field(..., min_length=1, description="The question to ask about the company")
-    company_name: str = Field(..., min_length=1, description="The name of the company to ask about")
-    model_name: Optional[str] = Field("gpt-3.5-turbo", description="OpenAI model to use")
-    temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0, description="Temperature for response randomness")
+class UpdateLeadsResponse(BaseModel):
+    """Response model for update leads operation."""
+    companyName: str
+    totalLeadsFetched: int
+    totalAssignees: int
+    totalDocumentsCreated: int
+    assigneeBreakdown: Dict[str, int]
 
-class AddDocumentRequest(BaseModel):
-    """Request model for adding a company document."""
-    company_name: str = Field(..., min_length=1, description="The name of the company")
-    content: str = Field(..., min_length=1, description="The content of the document")
-    filename: str = Field(..., min_length=1, description="The filename for the document")
+class AskRequest(BaseModel):
+    """Request model for asking questions using RAG."""
+    companyName: str = Field(..., min_length=1, description="The name of the company")
+    question: str = Field(..., min_length=1, description="The natural language question")
 
-class QuestionResponse(BaseModel):
-    """Response model for question answers."""
-    question: str
+class AskResponse(BaseModel):
+    """Response model for ask operation."""
     answer: str
-    model_used: str
-    temperature: float
-
-class CompanyQuestionResponse(BaseModel):
-    """Response model for company-specific question answers."""
-    question: str
-    answer: str
-    company_name: str
-    model_used: str
-    temperature: float
-
-class HealthResponse(BaseModel):
-    """Response model for health check."""
-    status: str
-    message: str
-
-class CompaniesResponse(BaseModel):
-    """Response model for listing companies."""
-    companies: List[str]
-    count: int
+    sources: List[Dict[str, Any]]
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="AI Chat Agent API",
-    description="A REST API for interacting with an AI chat agent powered by LangChain and OpenAI",
+    title="Semantic RAG Pipeline API",
+    description="API for lead processing and semantic question answering",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# Add CORS middleware to allow cross-origin requests
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global agent instances
-agent_instance = None
-rag_agent_instance = None
+# Optional, delete the vector store
+# @app.post("/delete-vector-store", response_model=UpdateLeadsResponse)
+# async def delete_vector_store(request: UpdateLeadsRequest):
+#     print("Starting deletion of vectors...")
+#     response = delete_vectors_by_filter(request.companyName)
+#     print(response)
 
-def get_agent(model_name: str = "gpt-3.5-turbo", temperature: float = 0.7) -> BasicAIAgent:
-    """Get or create an AI agent instance."""
-    global agent_instance
+@app.post("/update-leads", response_model=UpdateLeadsResponse)
+async def update_leads(request: UpdateLeadsRequest):
+    """
+    Fetch leads from company-specific Firebase, group by assignee, chunk optimally, and upsert to OpenAI Vector Store.
+    
+    Steps:
+    1. Initialize Firebase app for the company
+    2. Fetch all leads from Firebase
+    3. Optionally filter leads by assignedTo/assignedToId
+    4. Group leads by assignee
+    5. Create chunked documents for each assignee group
+    6. Upsert chunked documents to vector store
+    7. Return summary with assignee breakdown
+    """
     try:
-        # Create new agent if parameters changed or no agent exists
-        if (agent_instance is None or 
-            getattr(agent_instance, 'model_name', None) != model_name or
-            getattr(agent_instance.llm, 'temperature', None) != temperature):
-            agent_instance = BasicAIAgent(model_name=model_name, temperature=temperature)
-            # Store model name for comparison
-            agent_instance.model_name = model_name
-        return agent_instance
+        logger.info(f"Processing update-leads request for company: {request.companyName}")
+        
+        # Step 1: Initialize Firebase app
+        init_firebase_app(request.companyName)
+        
+        # Step 2: Fetch all leads
+        leads = fetch_all_leads(request.companyName)
+        total_leads_fetched = len(leads)
+        
+        logger.info(f"Fetched {total_leads_fetched} leads for {request.companyName}")
+        
+        # Step 3: Filter leads if assignedTo or assignedToId provided
+        if request.assignedTo or request.assignedToId:
+            filtered_leads = []
+            for lead in leads:
+                assigned_to_match = True
+                assigned_to_id_match = True
+                
+                if request.assignedTo:
+                    assigned_to_match = lead.get('assignedTo') == request.assignedTo
+                
+                if request.assignedToId:
+                    assigned_to_id_match = lead.get('assignedToId') == request.assignedToId
+                
+                if assigned_to_match and assigned_to_id_match:
+                    filtered_leads.append(lead)
+            
+            leads = filtered_leads
+            logger.info(f"Filtered to {len(leads)} leads based on assignedTo/assignedToId")
+        
+        if not leads:
+            logger.warning(f"No leads found for {request.companyName} after filtering")
+            return UpdateLeadsResponse(
+                companyName=request.companyName,
+                totalLeadsFetched=total_leads_fetched,
+                totalAssignees=0,
+                totalDocumentsCreated=0,
+                assigneeBreakdown={}
+            )
+        
+        # Step 4: Group leads by assignee
+        grouped_leads = group_leads_by_assignee(leads)
+        
+        # Step 5: Create chunked documents for each assignee group
+        chunked_documents = create_chunked_documents(grouped_leads, request.companyName)
+        
+        # Create assignee breakdown
+        assignee_breakdown = {}
+        for assignee, assignee_leads in grouped_leads.items():
+            assignee_breakdown[assignee] = len(assignee_leads)
+        
+        # Step 6: Upsert chunked documents to vector store
+        total_documents_created = 0
+        if chunked_documents:
+            upsert_result = upsert_chunked_documents(request.companyName, chunked_documents)
+            total_documents_created = upsert_result.get('upserted', 0)
+            logger.info(f"Upserted {total_documents_created} chunked documents to vector store")
+        
+        # Step 7: Return summary
+        return UpdateLeadsResponse(
+            companyName=request.companyName,
+            totalLeadsFetched=total_leads_fetched,
+            totalAssignees=len(grouped_leads),
+            totalDocumentsCreated=total_documents_created,
+            assigneeBreakdown=assignee_breakdown
+        )
+        
+    except FileNotFoundError as e:
+        logger.error(f"Firebase configuration not found: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize AI agent: {str(e)}")
+        logger.error(f"Error in update-leads: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-def get_rag_agent(model_name: str = "gpt-3.5-turbo", temperature: float = 0.7) -> CompanyRAGAgent:
-    """Get or create a RAG agent instance."""
-    global rag_agent_instance
+@app.post("/ask", response_model=AskResponse)
+async def ask_question(request: AskRequest):
+    """
+    Retrieve top 10 semantically relevant lead docs and answer using GPT-4o (RAG).
+    
+    Steps:
+    1. Get vector store name for the company
+    2. Search vector store for semantically similar documents
+    3. Build RAG prompt with retrieved documents
+    4. Call GPT-4o with the RAG prompt
+    5. Return answer and sources
+    """
     try:
-        # Create new agent if parameters changed or no agent exists
-        if (rag_agent_instance is None or 
-            getattr(rag_agent_instance.llm, 'model_name', None) != model_name or
-            getattr(rag_agent_instance.llm, 'temperature', None) != temperature):
-            rag_agent_instance = CompanyRAGAgent(model_name=model_name, temperature=temperature)
-        return rag_agent_instance
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize RAG agent: {str(e)}")
+        logger.info(f"Processing ask request for company: {request.companyName}")
+        
+        # Step 1 & 2: Search vector store
+        vector_store_name = getVectorStoreName(request.companyName)
+        search_results = search_vector_store(request.companyName, request.question, top_k=20)
+        
+        if not search_results:
+            logger.warning(f"No search results found for {request.companyName}")
+            return AskResponse(
+                answer="I don't have any lead data available for this company in the vector store. Please ensure leads have been processed using the /update-leads endpoint first.",
+                sources=[]
+            )
+        
+        # Step 3: Build RAG prompt
+        docs_context = []
+        sources = []
+        
+        for i, result in enumerate(search_results[:10]):
+            metadata = result.get('metadata', {})
+            content = result.get('content', '')
+            
+            # Extract key metadata for display (adapted for chunked documents)
+            assignee = metadata.get('assignedTo', 'Unknown')
+            chunk_info = f"chunk {metadata.get('chunk_index', 0) + 1}/{metadata.get('total_chunks', 1)}"
+            total_leads = metadata.get('total_leads', 'Unknown')
+            
+            doc_summary = f"Assignee: {assignee}, {chunk_info}, Total Leads: {total_leads}"
+            docs_context.append(f"Document {i+1}: {doc_summary}\nContent: {content}\n")
+            
+            sources.append({
+                "assignee": assignee,
+                "chunk_index": metadata.get('chunk_index', 0),
+                "total_chunks": metadata.get('total_chunks', 1),
+                "total_leads": metadata.get('total_leads', 0),
+                "score": result.get('score', 0.0),
+                "metadata": metadata,
+                "snippet": content[:300] + "..." if len(content) > 300 else content
+            })
+        
+        rag_prompt = f"""You are a sales analyst working with grouped lead data. User question: {request.question}
 
-@app.get("/", response_model=HealthResponse)
+Here are the top relevant lead portfolios (each document contains multiple leads grouped by assignee):
+
+{''.join(docs_context)}
+
+Please answer the user's question concisely and include numeric comparisons (e.g., % change, counts) where applicable. If specific data is missing, say so clearly. 
+
+Structure your response with these sections when relevant:
+- Lead Volume & Trends (by assignee)
+- Engagement & Follow-ups  
+- Source & Quality
+- Stakeholder Activity
+- Smart Observations
+- Final Summary with actionable recommendations
+
+Focus on being analytical and data-driven in your response. Note that each document represents a portfolio of leads for a specific assignee."""
+        
+        # Step 4: Call GPT-4o
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a helpful sales analyst assistant."},
+                    {"role": "user", "content": rag_prompt}
+                ],
+                temperature=0.3,  # Lower temperature for more consistent analytical responses
+                max_tokens=1500
+            )
+            
+            answer = response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"Error calling GPT-4o: {e}")
+            # Fallback to GPT-3.5-turbo if GPT-4o fails
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful sales analyst assistant."},
+                        {"role": "user", "content": rag_prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=1500
+                )
+                answer = response.choices[0].message.content
+            except Exception as fallback_e:
+                logger.error(f"Error with fallback model: {fallback_e}")
+                raise HTTPException(status_code=500, detail="Error generating response from AI model")
+        
+        # Step 5: Return response
+        return AskResponse(
+            answer=answer,
+            sources=sources
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in ask endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/")
 async def root():
     """Root endpoint - health check."""
-    return HealthResponse(
-        status="healthy",
-        message="AI Chat Agent API is running! Visit /docs for API documentation."
-    )
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint."""
-    return HealthResponse(
-        status="healthy",
-        message="AI Chat Agent API is operational"
-    )
-
-@app.post("/ask", response_model=QuestionResponse)
-async def ask_question(request: QuestionRequest):
-    """
-    Ask the AI agent a question.
-    
-    Args:
-        request: QuestionRequest containing the question and optional parameters
-        
-    Returns:
-        QuestionResponse with the AI's answer
-    """
-    try:
-        # Get or create agent with specified parameters
-        agent = get_agent(model_name=request.model_name, temperature=request.temperature)
-        
-        # Get response from agent
-        answer = agent.ask_question(request.question)
-        
-        return QuestionResponse(
-            question=request.question,
-            answer=answer,
-            model_used=request.model_name,
-            temperature=request.temperature
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
-
-@app.post("/chat")
-async def chat_endpoint(request: QuestionRequest):
-    """
-    Alternative chat endpoint with simpler response format.
-    
-    Args:
-        request: QuestionRequest containing the question and optional parameters
-        
-    Returns:
-        Simple JSON response with the answer
-    """
-    try:
-        agent = get_agent(model_name=request.model_name, temperature=request.temperature)
-        answer = agent.ask_question(request.question)
-        
-        return {
-            "response": answer,
-            "status": "success"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
-
-@app.post("/ask-company", response_model=CompanyQuestionResponse)
-async def ask_company_question(request: CompanyQuestionRequest):
-    """
-    Ask a question about a specific company using RAG.
-    
-    Args:
-        request: CompanyQuestionRequest containing the question, company name and optional parameters
-        
-    Returns:
-        CompanyQuestionResponse with the AI's answer based on company documents
-    """
-    try:
-        # Get or create RAG agent with specified parameters
-        rag_agent = get_rag_agent(model_name=request.model_name, temperature=request.temperature)
-        
-        # Get response from RAG agent
-        answer = rag_agent.ask_company_question(request.question, request.company_name)
-        
-        return CompanyQuestionResponse(
-            question=request.question,
-            answer=answer,
-            company_name=request.company_name,
-            model_used=request.model_name,
-            temperature=request.temperature
-        )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing company question: {str(e)}")
-
-@app.get("/companies", response_model=CompaniesResponse)
-async def list_companies():
-    """
-    List all available companies in the knowledge base.
-    
-    Returns:
-        CompaniesResponse with list of company names
-    """
-    try:
-        rag_agent = get_rag_agent()
-        companies = rag_agent.list_available_companies()
-        
-        return CompaniesResponse(
-            companies=companies,
-            count=len(companies)
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing companies: {str(e)}")
-
-@app.post("/add-company-document")
-async def add_company_document(request: AddDocumentRequest):
-    """
-    Add a document for a specific company to the knowledge base.
-    
-    Args:
-        request: AddDocumentRequest containing company name, content, and filename
-        
-    Returns:
-        Success message
-    """
-    try:
-        rag_agent = get_rag_agent()
-        rag_agent.add_company_document(
-            company_name=request.company_name,
-            content=request.content,
-            filename=request.filename
-        )
-        
-        return {
-            "status": "success",
-            "message": f"Document '{request.filename}' added for company '{request.company_name}'"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding document: {str(e)}")
-
-@app.post("/create-company-vectorstore/{company_name}")
-async def create_company_vectorstore(company_name: str, force_recreate: bool = False):
-    """
-    Create or recreate vector store for a specific company.
-    
-    Args:
-        company_name: Name of the company
-        force_recreate: Whether to force recreation of existing vector store
-        
-    Returns:
-        Success message
-    """
-    try:
-        rag_agent = get_rag_agent()
-        rag_agent.create_company_vectorstore(company_name, force_recreate=force_recreate)
-        
-        return {
-            "status": "success",
-            "message": f"Vector store created for company '{company_name}'"
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating vector store: {str(e)}")
-
-@app.get("/models")
-async def list_available_models():
-    """
-    List available OpenAI models that can be used.
-    
-    Returns:
-        List of available model names and API capabilities
-    """
-    available_models = [
-        "gpt-3.5-turbo",
-        "gpt-3.5-turbo-16k",
-        "gpt-4",
-        "gpt-4-turbo-preview",
-        "gpt-4o",
-        "gpt-4o-mini"
-    ]
-    
     return {
-        "available_models": available_models,
-        "default_model": "gpt-3.5-turbo",
-        "note": "Model availability depends on your OpenAI API access level",
-        "features": {
-            "basic_chat": "Available via /ask and /chat endpoints",
-            "company_rag": "Company-specific Q&A via /ask-company endpoint",
-            "document_management": "Add company documents via /add-company-document endpoint",
-            "company_listing": "List available companies via /companies endpoint"
-        }
+        "message": "Semantic RAG Pipeline API is running",
+        "endpoints": ["/update-leads", "/ask"],
+        "docs": "/docs"
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "message": "API is operational"}
+
+@app.get("/vector-store-status/{company_name}")
+async def vector_store_status(company_name: str):
+    """Check if vector store exists and has data for a company."""
+    try:
+        from vectorstore_utils import getVectorStoreName
+        
+        vector_store_name = getVectorStoreName(company_name)
+        
+        # Find vector store
+        vector_stores = client.beta.vector_stores.list()
+        target_store = None
+        
+        for store in vector_stores.data:
+            if store.name == vector_store_name:
+                target_store = store
+                break
+        
+        if not target_store:
+            return {
+                "company": company_name,
+                "vector_store_exists": False,
+                "file_count": 0,
+                "status": "no_data"
+            }
+        
+        # Get file count
+        vector_store_files = client.beta.vector_stores.files.list(
+            vector_store_id=target_store.id,
+            limit=100
+        )
+        
+        return {
+            "company": company_name,
+            "vector_store_exists": True,
+            "vector_store_id": target_store.id,
+            "file_count": len(vector_store_files.data),
+            "status": "ready" if len(vector_store_files.data) > 0 else "empty"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking vector store status for {company_name}: {e}")
+        return {
+            "company": company_name,
+            "vector_store_exists": False,
+            "file_count": 0,
+            "status": "error",
+            "error": str(e)
+        }
+
 if __name__ == "__main__":
-    # Run the FastAPI application
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8008,
-        reload=True,  # Enable auto-reload during development
-        log_level="info"
-    )
+    # Check for required environment variables
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("OPENAI_API_KEY environment variable is required")
+        exit(1)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8008)
