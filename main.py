@@ -15,12 +15,10 @@ from openai import OpenAI
 
 # Import our utility modules
 from firebase_utils import init_firebase_app, fetch_all_leads
-from flatten_utils import flattenLeadToText
+from chunking_utils import group_leads_by_assignee, create_chunked_documents
 from vectorstore_utils import (
     getVectorStoreName, 
-    fetch_existing_metadata_map, 
-    embed_texts, 
-    upsert_lead_documents,
+    upsert_chunked_documents,
     delete_vectors_by_filter,
     search_vector_store
 )
@@ -44,15 +42,15 @@ class UpdateLeadsRequest(BaseModel):
     """Request model for updating leads in vector store."""
     companyName: str = Field(..., min_length=1, description="The name of the company")
     assignedTo: Optional[str] = Field(None, description="Filter by assigned to name")
-    assignedToId: Optional[str] = Field(None, description="Filter by assigned to ID") 
-    forceRefresh: bool = Field(False, description="Force refresh all leads")
+    assignedToId: Optional[str] = Field(None, description="Filter by assigned to ID")
 
 class UpdateLeadsResponse(BaseModel):
     """Response model for update leads operation."""
     companyName: str
     totalLeadsFetched: int
-    totalUpserted: int
-    totalSkipped: int
+    totalAssignees: int
+    totalDocumentsCreated: int
+    assigneeBreakdown: Dict[str, int]
 
 class AskRequest(BaseModel):
     """Request model for asking questions using RAG."""
@@ -82,19 +80,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional, delete the vector store
+# @app.post("/delete-vector-store", response_model=UpdateLeadsResponse)
+# async def delete_vector_store(request: UpdateLeadsRequest):
+#     print("Starting deletion of vectors...")
+#     response = delete_vectors_by_filter(request.companyName)
+#     print(response)
+
 @app.post("/update-leads", response_model=UpdateLeadsResponse)
 async def update_leads(request: UpdateLeadsRequest):
     """
-    Fetch leads from company-specific Firebase, flatten, embed, and upsert to OpenAI Vector Store.
+    Fetch leads from company-specific Firebase, group by assignee, chunk optimally, and upsert to OpenAI Vector Store.
     
     Steps:
     1. Initialize Firebase app for the company
     2. Fetch all leads from Firebase
     3. Optionally filter leads by assignedTo/assignedToId
-    4. Check existing metadata to determine which leads need updating
-    5. Flatten leads to text and prepare for embedding
-    6. Batch embed and upsert to vector store
-    7. Return summary
+    4. Group leads by assignee
+    5. Create chunked documents for each assignee group
+    6. Upsert chunked documents to vector store
+    7. Return summary with assignee breakdown
     """
     try:
         logger.info(f"Processing update-leads request for company: {request.companyName}")
@@ -127,69 +132,41 @@ async def update_leads(request: UpdateLeadsRequest):
             leads = filtered_leads
             logger.info(f"Filtered to {len(leads)} leads based on assignedTo/assignedToId")
         
-        # Step 4: Check existing metadata to determine updates needed
-        existing_map = fetch_existing_metadata_map(request.companyName) if not request.forceRefresh else {}
+        if not leads:
+            logger.warning(f"No leads found for {request.companyName} after filtering")
+            return UpdateLeadsResponse(
+                companyName=request.companyName,
+                totalLeadsFetched=total_leads_fetched,
+                totalAssignees=0,
+                totalDocumentsCreated=0,
+                assigneeBreakdown={}
+            )
         
-        leads_to_upsert = []
-        for lead in leads:
-            lead_id = lead.get('id')
-            updated_at = lead.get('updatedAt')
-            
-            if (lead_id not in existing_map or 
-                updated_at != existing_map.get(lead_id) or 
-                request.forceRefresh):
-                leads_to_upsert.append(lead)
+        # Step 4: Group leads by assignee
+        grouped_leads = group_leads_by_assignee(leads)
         
-        total_skipped = len(leads) - len(leads_to_upsert)
-        logger.info(f"Need to upsert {len(leads_to_upsert)} leads, skipping {total_skipped}")
+        # Step 5: Create chunked documents for each assignee group
+        chunked_documents = create_chunked_documents(grouped_leads, request.companyName)
         
-        # Step 5: Prepare items for embedding and upserting
-        items = []
-        for lead in leads_to_upsert:
-            try:
-                # Flatten lead to text
-                text = flattenLeadToText(lead, request.companyName)
-                
-                # Prepare metadata in camelCase
-                metadata = {
-                    "companyName": request.companyName,
-                    "assignedTo": lead.get('assignedTo', ''),
-                    "assignedToId": lead.get('assignedToId', ''),
-                    "updatedAt": lead.get('updatedAt', ''),
-                    "projectCity": lead.get('projectCity', ''),
-                    "projectCategory": lead.get('projectCategory', ''),
-                    "id": lead.get('id', ''),
-                    "generatedAt": lead.get('generatedAt', ''),
-                    "projectStage": lead.get('projectStage', ''),
-                    "projectSource": lead.get('projectSource', '')
-                }
-                
-                # Remove empty values from metadata
-                metadata = {k: v for k, v in metadata.items() if v}
-                
-                items.append({
-                    "id": lead.get('id', ''),
-                    "text": text,
-                    "metadata": metadata
-                })
-                
-            except Exception as e:
-                logger.warning(f"Error processing lead {lead.get('id', 'unknown')}: {e}")
-                continue
+        # Create assignee breakdown
+        assignee_breakdown = {}
+        for assignee, assignee_leads in grouped_leads.items():
+            assignee_breakdown[assignee] = len(assignee_leads)
         
-        # Step 6: Upsert to vector store
-        total_upserted = 0
-        if items:
-            upsert_result = upsert_lead_documents(request.companyName, items)
-            total_upserted = upsert_result.get('upserted', 0)
-            logger.info(f"Upserted {total_upserted} leads to vector store")
+        # Step 6: Upsert chunked documents to vector store
+        total_documents_created = 0
+        if chunked_documents:
+            upsert_result = upsert_chunked_documents(request.companyName, chunked_documents)
+            total_documents_created = upsert_result.get('upserted', 0)
+            logger.info(f"Upserted {total_documents_created} chunked documents to vector store")
         
         # Step 7: Return summary
         return UpdateLeadsResponse(
             companyName=request.companyName,
             totalLeadsFetched=total_leads_fetched,
-            totalUpserted=total_upserted,
-            totalSkipped=total_skipped
+            totalAssignees=len(grouped_leads),
+            totalDocumentsCreated=total_documents_created,
+            assigneeBreakdown=assignee_breakdown
         )
         
     except FileNotFoundError as e:
@@ -233,38 +210,41 @@ async def ask_question(request: AskRequest):
             metadata = result.get('metadata', {})
             content = result.get('content', '')
             
-            # Extract key metadata for display
-            lead_id = metadata.get('id', f'doc_{i}')
-            project_city = metadata.get('projectCity', 'Unknown')
-            updated_at = metadata.get('updatedAt', 'Unknown')
+            # Extract key metadata for display (adapted for chunked documents)
+            assignee = metadata.get('assignedTo', 'Unknown')
+            chunk_info = f"chunk {metadata.get('chunk_index', 0) + 1}/{metadata.get('total_chunks', 1)}"
+            total_leads = metadata.get('total_leads', 'Unknown')
             
-            doc_summary = f"Lead ID: {lead_id}, City: {project_city}, Updated: {updated_at}"
+            doc_summary = f"Assignee: {assignee}, {chunk_info}, Total Leads: {total_leads}"
             docs_context.append(f"Document {i+1}: {doc_summary}\nContent: {content}\n")
             
             sources.append({
-                "id": lead_id,
+                "assignee": assignee,
+                "chunk_index": metadata.get('chunk_index', 0),
+                "total_chunks": metadata.get('total_chunks', 1),
+                "total_leads": metadata.get('total_leads', 0),
                 "score": result.get('score', 0.0),
                 "metadata": metadata,
-                "snippet": content[:200] + "..." if len(content) > 200 else content
+                "snippet": content[:300] + "..." if len(content) > 300 else content
             })
         
-        rag_prompt = f"""You are a sales analyst. User question: {request.question}
+        rag_prompt = f"""You are a sales analyst working with grouped lead data. User question: {request.question}
 
-Here are the top relevant leads (metadata + content):
+Here are the top relevant lead portfolios (each document contains multiple leads grouped by assignee):
 
 {''.join(docs_context)}
 
 Please answer the user's question concisely and include numeric comparisons (e.g., % change, counts) where applicable. If specific data is missing, say so clearly. 
 
 Structure your response with these sections when relevant:
-- Lead Volume & Trends
+- Lead Volume & Trends (by assignee)
 - Engagement & Follow-ups  
 - Source & Quality
 - Stakeholder Activity
 - Smart Observations
 - Final Summary with actionable recommendations
 
-Focus on being analytical and data-driven in your response."""
+Focus on being analytical and data-driven in your response. Note that each document represents a portfolio of leads for a specific assignee."""
         
         # Step 4: Call GPT-4o
         try:
@@ -323,6 +303,55 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "message": "API is operational"}
+
+@app.get("/vector-store-status/{company_name}")
+async def vector_store_status(company_name: str):
+    """Check if vector store exists and has data for a company."""
+    try:
+        from vectorstore_utils import getVectorStoreName
+        
+        vector_store_name = getVectorStoreName(company_name)
+        
+        # Find vector store
+        vector_stores = client.beta.vector_stores.list()
+        target_store = None
+        
+        for store in vector_stores.data:
+            if store.name == vector_store_name:
+                target_store = store
+                break
+        
+        if not target_store:
+            return {
+                "company": company_name,
+                "vector_store_exists": False,
+                "file_count": 0,
+                "status": "no_data"
+            }
+        
+        # Get file count
+        vector_store_files = client.beta.vector_stores.files.list(
+            vector_store_id=target_store.id,
+            limit=100
+        )
+        
+        return {
+            "company": company_name,
+            "vector_store_exists": True,
+            "vector_store_id": target_store.id,
+            "file_count": len(vector_store_files.data),
+            "status": "ready" if len(vector_store_files.data) > 0 else "empty"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking vector store status for {company_name}: {e}")
+        return {
+            "company": company_name,
+            "vector_store_exists": False,
+            "file_count": 0,
+            "status": "error",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     # Check for required environment variables

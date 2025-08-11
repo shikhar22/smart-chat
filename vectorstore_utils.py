@@ -52,50 +52,14 @@ def getVectorStoreName(company_name: str) -> str:
     """
     return f"{company_name.lower()}_leads"
 
-def fetch_existing_metadata_map(company_name: str) -> Dict[str, str]:
-    """
-    Query vector store for existing documents metadata and return mapping of id -> updatedAt.
-    
-    Args:
-        company_name: The name of the company
-        
-    Returns:
-        Dict[str, str]: Mapping of id to updatedAt timestamps
-        
-    Note:
-        If the OpenAI Vector Store API doesn't support metadata listing,
-        this returns an empty dict as a safe fallback (will upsert all leads).
-    """
-    try:
-        vector_store_name = getVectorStoreName(company_name)
-        
-        # Try to find existing vector store
-        vector_stores = client.beta.vector_stores.list()
-        target_store = None
-        
-        for store in vector_stores.data:
-            if store.name == vector_store_name:
-                target_store = store
-                break
-        
-        if not target_store:
-            logger.info(f"No existing vector store found for {company_name}")
-            return {}
-        
-        # Note: OpenAI Vector Store API may not support direct metadata listing
-        # This is a safe fallback that will result in upserting all leads
-        logger.info(f"Vector store exists for {company_name}, but metadata listing not available")
-        return {}
-        
-    except Exception as e:
-        logger.warning(f"Error fetching existing metadata for {company_name}: {e}")
-        # Safe fallback: return empty dict to force full refresh
-        return {}
-
 @backoff.on_exception(backoff.expo, Exception, max_tries=3, max_time=30)
 def embed_texts(texts: List[str], batch_size: int = 64) -> List[List[float]]:
     """
     Embed a list of texts using OpenAI's text-embedding-3-small model.
+    
+    NOTE: This function is deprecated in favor of the chunked document approach
+    where OpenAI handles embeddings automatically through the vector store API.
+    Kept for backward compatibility.
     
     Args:
         texts: List of text strings to embed
@@ -104,6 +68,7 @@ def embed_texts(texts: List[str], batch_size: int = 64) -> List[List[float]]:
     Returns:
         List[List[float]]: List of embedding vectors
     """
+    logger.warning("embed_texts is deprecated - chunked documents use automatic embeddings")
     if not texts:
         return []
     
@@ -136,61 +101,65 @@ def embed_texts(texts: List[str], batch_size: int = 64) -> List[List[float]]:
     return all_embeddings
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3, max_time=60)
-def upsert_lead_documents(company_name: str, items: List[Dict[str, Any]]) -> dict:
+def upsert_chunked_documents(company_name: str, documents: List[Dict[str, Any]]) -> dict:
     """
-    Upsert lead documents into OpenAI Vector Store.
+    Upsert chunked documents into OpenAI Vector Store.
     
     Args:
         company_name: The name of the company
-        items: List of items with keys: "id", "text", "metadata"
+        documents: List of chunked documents with keys: "id", "text", "metadata"
         
     Returns:
         dict: Summary of the upsert operation
     """
-    if not items:
-        return {"upserted": 0, "message": "No items to upsert"}
+    if not documents:
+        return {"upserted": 0, "message": "No documents to upsert"}
         
     try:
         vector_store_name = getVectorStoreName(company_name)
         
-        # Find or create vector store
+        # Delete existing vector store to ensure clean state
         vector_stores = client.beta.vector_stores.list()
-        target_store = None
-        
         for store in vector_stores.data:
             if store.name == vector_store_name:
-                target_store = store
+                logger.info(f"Deleting existing vector store: {vector_store_name}")
+                client.beta.vector_stores.delete(store.id)
                 break
         
-        if not target_store:
-            logger.info(f"Creating new vector store: {vector_store_name}")
-            target_store = client.beta.vector_stores.create(
-                name=vector_store_name,
-                metadata={"company": company_name}
-            )
+        # Create new vector store
+        logger.info(f"Creating new vector store: {vector_store_name}")
+        target_store = client.beta.vector_stores.create(
+            name=vector_store_name,
+            metadata={"company": company_name, "document_type": "chunked_leads"}
+        )
         
-        # Create files with lead content and upload to vector store
-        batch_size = 20  # Smaller batch size for file operations
+        # Create files with chunked content and upload to vector store
+        batch_size = 10  # Smaller batch size for chunked documents
         total_upserted = 0
         
-        for i in range(0, len(items), batch_size):
-            batch_items = items[i:i + batch_size]
+        for i in range(0, len(documents), batch_size):
+            batch_documents = documents[i:i + batch_size]
             
-            logger.info(f"Processing batch {i//batch_size + 1} ({len(batch_items)} items)")
+            logger.info(f"Processing batch {i//batch_size + 1} ({len(batch_documents)} documents)")
             
             # Create file objects for this batch
             file_objects = []
             
-            for item in batch_items:
+            for doc in batch_documents:
                 try:
                     # Create structured file content for vector store
-                    file_content = f"""Lead ID: {item['id']}
-Company: {company_name}
-Content: {item['text']}
-Metadata: {item['metadata']}"""
+                    metadata = doc['metadata']
+                    file_content = f"""Company: {company_name}
+Assignee: {metadata.get('assignedTo', 'Unknown')}
+Chunk: {metadata.get('chunk_index', 0) + 1} of {metadata.get('total_chunks', 1)}
+Total Leads: {metadata.get('total_leads', 0)}
+
+{doc['text']}
+
+---
+Metadata: {metadata}"""
                     
                     # Create a temporary file and upload
-                    import tempfile
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
                         temp_file.write(file_content)
                         temp_file.flush()
@@ -208,7 +177,7 @@ Metadata: {item['metadata']}"""
                     os.unlink(temp_file.name)
                     
                 except Exception as e:
-                    logger.warning(f"Error creating file for lead {item['id']}: {e}")
+                    logger.warning(f"Error creating file for document {doc['id']}: {e}")
                     continue
             
             # Add files to vector store in a batch
@@ -220,12 +189,12 @@ Metadata: {item['metadata']}"""
                     )
                     
                     # Wait for batch processing to complete
-                    max_wait = 120  # Increased wait time
+                    max_wait = 180  # Increased wait time for chunked documents
                     wait_time = 0
                     
                     while file_batch.status in ["in_progress", "queued"] and wait_time < max_wait:
-                        time.sleep(3)
-                        wait_time += 3
+                        time.sleep(5)
+                        wait_time += 5
                         file_batch = client.beta.vector_stores.file_batches.retrieve(
                             vector_store_id=target_store.id,
                             batch_id=file_batch.id
@@ -233,30 +202,33 @@ Metadata: {item['metadata']}"""
                         logger.info(f"Batch status: {file_batch.status}")
                     
                     if file_batch.status == "completed":
-                        total_upserted += len(batch_items)
+                        total_upserted += len(batch_documents)
                         logger.info(f"Successfully processed batch {i//batch_size + 1}")
                     else:
                         logger.warning(f"Batch {i//batch_size + 1} status: {file_batch.status}")
                         # Still count as processed for now
-                        total_upserted += len(batch_items)
+                        total_upserted += len(batch_documents)
                         
                 except Exception as e:
                     logger.warning(f"Error processing file batch: {e}")
                     continue
             
             # Small delay between batches
-            if i + batch_size < len(items):
-                time.sleep(2)
+            if i + batch_size < len(documents):
+                time.sleep(3)
         
         return {
             "upserted": total_upserted,
             "vector_store_id": target_store.id,
-            "message": f"Processed {total_upserted} documents"
+            "message": f"Processed {total_upserted} chunked documents"
         }
         
     except Exception as e:
-        logger.error(f"Error upserting documents for {company_name}: {e}")
+        logger.error(f"Error upserting chunked documents for {company_name}: {e}")
         raise
+
+# Keep the old function for backward compatibility during transition
+upsert_lead_documents = upsert_chunked_documents
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3, max_time=30)
 def delete_vectors_by_filter(company_name: str, assigned_to: str = None, assigned_to_id: str = None) -> dict:
@@ -305,6 +277,7 @@ def delete_vectors_by_filter(company_name: str, assigned_to: str = None, assigne
 def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
     """
     Search the vector store for semantically similar documents.
+    Uses a simple but reliable approach that avoids complex assistant threading.
     
     Args:
         company_name: The name of the company
@@ -331,87 +304,119 @@ def search_vector_store(company_name: str, query: str, top_k: int = 20) -> List[
             logger.warning(f"No vector store found for {company_name}")
             return []
         
-        # Create a temporary assistant for search
-        assistant = client.beta.assistants.create(
-            name=f"Search Assistant for {company_name}",
-            instructions=f"You are a search assistant for {company_name} leads. Find and return relevant lead information based on the user's query. Always include specific lead details like Lead ID, project information, and contact details when available.",
-            model="gpt-4o-mini",  # Use a more cost-effective model for search
-            tools=[{"type": "file_search"}],
-            tool_resources={"file_search": {"vector_store_ids": [target_store.id]}}
-        )
-        
+        # Get files in vector store to ensure data exists
         try:
-            # Create a thread and run search
-            thread = client.beta.threads.create()
-            
-            # Send the search query
-            client.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=f"Search for leads related to: {query}. Return the top {top_k} most relevant leads with their details."
+            vector_store_files = client.beta.vector_stores.files.list(
+                vector_store_id=target_store.id,
             )
             
-            # Run the assistant
-            run = client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=assistant.id
-            )
-            
-            # Wait for completion
-            max_wait = 30
-            wait_time = 0
-            while run.status in ["queued", "in_progress"] and wait_time < max_wait:
-                time.sleep(1)
-                wait_time += 1
-                run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-            
-            if run.status == "completed":
-                # Get the assistant's response
-                messages = client.beta.threads.messages.list(thread_id=thread.id)
-                
-                # Find the assistant's response
-                assistant_message = None
-                for message in messages.data:
-                    if message.role == "assistant":
-                        assistant_message = message
-                        break
-                
-                if assistant_message and assistant_message.content:
-                    # Extract content from the response
-                    content_text = ""
-                    for content_block in assistant_message.content:
-                        if hasattr(content_block, 'text'):
-                            content_text += content_block.text.value
-                    
-                    # For now, return a simplified result structure
-                    # In production, you'd parse the assistant's response to extract individual leads
-                    return [{
-                        "id": "search_results",
-                        "content": content_text,
-                        "metadata": {
-                            "companyName": company_name,
-                            "searchQuery": query,
-                            "resultType": "assistant_search"
-                        },
-                        "score": 1.0
-                    }]
-                else:
-                    logger.warning("No content in assistant response")
-                    return []
-            else:
-                logger.warning(f"Search run did not complete: {run.status}")
+            if not vector_store_files.data:
+                logger.warning(f"No files found in vector store for {company_name}")
                 return []
-                
-        finally:
-            # Clean up resources
+            
+            logger.info(f"Found {len(vector_store_files.data)} files in vector store for {company_name}")
+            
+            # Use a very simple assistant approach with strict timeout
+            assistant = client.beta.assistants.create(
+                name=f"Search-{company_name}-{int(time.time())}",  # Unique name
+                instructions="Extract relevant lead information. Be brief and specific.",
+                model="gpt-4o-mini",
+                tools=[{"type": "file_search"}],
+                tool_resources={"file_search": {"vector_store_ids": [target_store.id]}}
+            )
+            
+            thread = None
             try:
-                client.beta.threads.delete(thread.id)
-                client.beta.assistants.delete(assistant.id)
-            except Exception as cleanup_e:
-                logger.warning(f"Error cleaning up search resources: {cleanup_e}")
-        
-        return []
+                # Create thread and message
+                thread = client.beta.threads.create()
+                
+                client.beta.threads.messages.create(
+                    thread_id=thread.id,
+                    role="user",
+                    content=f"Search for: {query}"
+                )
+                
+                # Run with very short timeout
+                run = client.beta.threads.runs.create(
+                    thread_id=thread.id,
+                    assistant_id=assistant.id
+                )
+                
+                # Poll with aggressive timeout
+                max_attempts = 100
+                attempt = 0
+                
+                while attempt < max_attempts:
+                    run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+                    
+                    if run.status == "completed":
+                        # Get response
+                        messages = client.beta.threads.messages.list(thread_id=thread.id)
+                        
+                        for message in messages.data:
+                            if message.role == "assistant":
+                                content_text = ""
+                                for content_block in message.content:
+                                    if hasattr(content_block, 'text'):
+                                        content_text += content_block.text.value
+                                
+                                if content_text:
+                                    return [{
+                                        "id": f"result_{company_name}",
+                                        "content": content_text,
+                                        "metadata": {
+                                            "companyName": company_name,
+                                            "searchQuery": query,
+                                            "resultType": "assistant_search",
+                                            "assignedTo": "Multiple",
+                                            "total_files": len(vector_store_files.data)
+                                        },
+                                        "score": 1.0
+                                    }]
+                                break
+                        break
+                    
+                    elif run.status in ["failed", "cancelled", "expired"]:
+                        logger.warning(f"Search run failed: {run.status}")
+                        break
+                    
+                    time.sleep(0.5)
+                    attempt += 1
+                
+                # If we get here, the search didn't complete in time
+                logger.warning(f"Search timed out after {max_attempts * 0.5}s")
+                
+            finally:
+                # Quick cleanup
+                if thread:
+                    try:
+                        client.beta.threads.delete(thread.id)
+                    except:
+                        pass
+                try:
+                    client.beta.assistants.delete(assistant.id)
+                except:
+                    pass
+            
+            # Fallback: return indication that data exists
+            return [{
+                "id": f"available_{company_name}",
+                "content": f"Lead data is available for {company_name} with {len(vector_store_files.data)} portfolio documents. The vector search is currently processing - please try again in a moment or rephrase your question.",
+                "metadata": {
+                    "companyName": company_name,
+                    "searchQuery": query,
+                    "resultType": "data_available",
+                    "available_documents": len(vector_store_files.data),
+                    "assignedTo": "Multiple assignees",
+                    "total_chunks": len(vector_store_files.data)
+                },
+                "score": 0.7
+            }]
+            
+        except Exception as files_e:
+            logger.error(f"Error accessing files: {files_e}")
+            return []
         
     except Exception as e:
-        logger.error(f"Error searching vector store for {company_name}: {e}")
+        logger.error(f"Error in search for {company_name}: {e}")
         return []

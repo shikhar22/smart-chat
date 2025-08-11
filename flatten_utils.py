@@ -45,13 +45,29 @@ def flattenLeadToText(lead: dict, company_name: str) -> str:
                    stripped in ["n/a", "na", "null", "none", "-", "tbd", "pending", "--select--"])
         if isinstance(value, (list, dict)):
             return len(value) == 0
+        # Handle Firebase DatetimeWithNanoseconds and other datetime objects
+        try:
+            # If it's a datetime-like object, it's not empty
+            if hasattr(value, 'strftime') or hasattr(value, 'isoformat'):
+                return False
+        except:
+            pass
         return False
     
     def format_date(date_value: Any) -> str:
         """Format date value to a readable string."""
         if is_empty_value(date_value):
             return None
-            
+        
+        # Handle Firebase DatetimeWithNanoseconds and other datetime objects
+        if hasattr(date_value, 'strftime'):
+            try:
+                return date_value.strftime("%B %d, %Y")
+            except:
+                # Fallback to string representation
+                return str(date_value)
+        
+        # Handle string dates        
         if isinstance(date_value, str):
             try:
                 # Try parsing common date formats
