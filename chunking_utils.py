@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Chunking Utilities Module
-Functions for grouping leads by assignee and creating optimal chunks for embedding.
+Functions for processing individual leads and creating optimal chunks for embedding.
 """
 
 import logging
@@ -14,84 +14,39 @@ logger = logging.getLogger(__name__)
 OPTIMAL_CHUNK_SIZE_MIN = 2000  # 2KB
 OPTIMAL_CHUNK_SIZE_MAX = 5000  # 5KB
 
-def group_leads_by_assignee(leads: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def create_lead_text(lead: Dict[str, Any], company_name: str) -> str:
     """
-    Group leads by assignedTo field.
+    Create text content from a single lead.
     
     Args:
-        leads: List of lead dictionaries
-        
-    Returns:
-        Dict[str, List[Dict[str, Any]]]: Dictionary with assignedTo as key and list of leads as value
-    """
-    grouped_leads = {}
-    unassigned_leads = []
-    
-    for lead in leads:
-        assigned_to = lead.get('assignedTo', '')
-        
-        # Handle different data types safely
-        if isinstance(assigned_to, str):
-            assigned_to = assigned_to.strip()
-        else:
-            assigned_to = str(assigned_to) if assigned_to else ''
-        
-        if not assigned_to or assigned_to.lower() in ['', 'null', 'none', 'n/a', 'unassigned']:
-            unassigned_leads.append(lead)
-        else:
-            if assigned_to not in grouped_leads:
-                grouped_leads[assigned_to] = []
-            grouped_leads[assigned_to].append(lead)
-    
-    # Add unassigned leads under a special key
-    if unassigned_leads:
-        grouped_leads['Unassigned'] = unassigned_leads
-    
-    logger.info(f"Grouped leads into {len(grouped_leads)} assignee groups")
-    for assignee, assignee_leads in grouped_leads.items():
-        logger.info(f"  - {assignee}: {len(assignee_leads)} leads")
-    
-    return grouped_leads
-
-def create_rich_text_block(leads: List[Dict[str, Any]], company_name: str, assignee: str) -> str:
-    """
-    Create a rich text block from multiple leads for a single assignee.
-    
-    Args:
-        leads: List of leads for this assignee
+        lead: Lead dictionary
         company_name: Company name
-        assignee: Assignee name
         
     Returns:
-        str: Rich text block containing all leads information
+        str: Text content for the lead
     """
-    text_parts = [
-        f"Sales Portfolio for {assignee} at {company_name}",
-        f"Total Leads: {len(leads)}",
-        "=" * 50
-    ]
-    
-    for i, lead in enumerate(leads, 1):
-        try:
-            # Get the flattened lead text
-            lead_text = flattenLeadToText(lead, company_name)
-            
-            # Add lead header with number
-            text_parts.append(f"\nLead #{i}:")
-            text_parts.append(lead_text)
-            text_parts.append("-" * 30)
-            
-        except Exception as e:
-            logger.warning(f"Error flattening lead {lead.get('id', 'unknown')}: {e}")
-            # Add basic info as fallback
-            text_parts.append(f"\nLead #{i}: {lead.get('id', 'unknown')} (processing error)")
-            text_parts.append("-" * 30)
-    
-    return "\n".join(text_parts)
+    try:
+        # Get the flattened lead text
+        lead_text = flattenLeadToText(lead, company_name)
+        
+        # Add lead identifier
+        lead_id = lead.get('id', 'unknown')
+        assignee = lead.get('assignedTo', 'Unassigned')
+        
+        formatted_text = f"Lead ID: {lead_id}\nAssigned To: {assignee}\nCompany: {company_name}\n\n{lead_text}"
+        
+        return formatted_text
+        
+    except Exception as e:
+        logger.warning(f"Error creating text for lead {lead.get('id', 'unknown')}: {e}")
+        # Return basic info as fallback
+        lead_id = lead.get('id', 'unknown')
+        assignee = lead.get('assignedTo', 'Unassigned')
+        return f"Lead ID: {lead_id}\nAssigned To: {assignee}\nCompany: {company_name}\n\n(Error processing lead content)"
 
 def split_text_into_chunks(text: str, max_chunk_size: int = OPTIMAL_CHUNK_SIZE_MAX) -> List[str]:
     """
-    Split text into chunks while trying to preserve lead boundaries.
+    Split text into chunks while preserving content structure.
     
     Args:
         text: The text to split
@@ -103,47 +58,11 @@ def split_text_into_chunks(text: str, max_chunk_size: int = OPTIMAL_CHUNK_SIZE_M
     if len(text) <= max_chunk_size:
         return [text]
     
-    chunks = []
+    # For individual leads, split by paragraphs first
+    chunks = split_by_paragraphs(text, max_chunk_size)
     
-    # Split by lead boundaries first (look for "Lead #" pattern)
-    lead_sections = text.split("\nLead #")
-    
-    if len(lead_sections) <= 1:
-        # No clear lead boundaries, split by paragraphs
-        return split_by_paragraphs(text, max_chunk_size)
-    
-    # Reconstruct first section (header)
-    current_chunk = lead_sections[0]
-    
-    for i, section in enumerate(lead_sections[1:], 1):
-        # Add back the "Lead #" prefix
-        section = f"\nLead #{section}"
-        
-        # Check if adding this section would exceed the limit
-        if len(current_chunk) + len(section) <= max_chunk_size:
-            current_chunk += section
-        else:
-            # Save current chunk and start new one
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            current_chunk = section
-    
-    # Add the last chunk
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    
-    # If any chunk is still too large, split it further
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= max_chunk_size:
-            final_chunks.append(chunk)
-        else:
-            # Split oversized chunks by paragraphs
-            sub_chunks = split_by_paragraphs(chunk, max_chunk_size)
-            final_chunks.extend(sub_chunks)
-    
-    logger.info(f"Split text ({len(text)} chars) into {len(final_chunks)} chunks")
-    return final_chunks
+    logger.info(f"Split text ({len(text)} chars) into {len(chunks)} chunks")
+    return chunks
 
 def split_by_paragraphs(text: str, max_chunk_size: int) -> List[str]:
     """
@@ -241,15 +160,68 @@ def split_by_sentences(text: str, max_chunk_size: int) -> List[str]:
     
     return chunks
 
+def prepare_record_for_pinecone(record):
+    """Flatten the record into a text blob and create metadata for filtering."""
+    # Format date fields properly
+    created_at = format_date_field(record.get('generatedAt'))
+    updated_at = format_date_field(record.get('updatedAt'))
+    
+    # Get timestamps for metadata filtering
+    created_at_timestamp = format_date_for_metadata(record.get('generatedAt'))
+    updated_at_timestamp = format_date_for_metadata(record.get('updatedAt'))
+    
+    text_blob = f"""
+    Project Name: {record.get('projectName', '')}
+    Project Category: {record.get('projectCategory', '')}
+    Project Stage: {record.get('projectStage', '')}
+    City: {record.get('projectCity', '')}
+    State: {record.get('projectState', '')}
+    Concern Person: {record.get('concernPerson', '')}
+    Assigned To: {record.get('assignedTo', '')}
+    Follow Ups: {record.get('followUp', '')}
+    Project Notes: {record.get('projectNotes', '')}
+    Lead ID: {record.get('id', '')}
+    Phone: {record.get('phone', '')}
+    Email: {record.get('email', '')}
+    Address: {record.get('address', '')}
+    Contact Person: {record.get('contactPerson', '')}
+    Lead Source: {record.get('leadSource', '')}
+    Priority: {record.get('priority', '')}
+    Budget: {record.get('budget', '')}
+    Timeline: {record.get('timeline', '')}
+    Requirements: {record.get('requirements', '')}
+    Status: {record.get('status', '')}
+    Next Action: {record.get('nextAction', '')}
+    Created At: {created_at}
+    Updated At: {updated_at}
+    """
+    
+    metadata = {
+        "assignedTo": record.get('assignedTo', ''),
+        "projectStage": record.get('projectStage', ''),
+        "city": record.get('projectCity', ''),
+        "state": record.get('projectState', ''),
+        "createdAt": created_at_timestamp,
+        "updatedAt": updated_at_timestamp,
+        "concernPerson": record.get('concernPerson', ''),
+        "projectCategory": record.get('projectCategory', ''),
+        "leadSource": record.get('leadSource', ''),
+        "priority": record.get('priority', ''),
+        "status": record.get('status', ''),
+        "phone": record.get('phone', ''),
+        "email": record.get('email', '')
+    }
+    return text_blob.strip(), metadata
+
 def create_chunked_documents(
-    grouped_leads: Dict[str, List[Dict[str, Any]]], 
+    leads: List[Dict[str, Any]], 
     company_name: str
 ) -> List[Dict[str, Any]]:
     """
-    Create chunked documents for all assignee groups.
+    Create documents for individual leads using the Pinecone format.
     
     Args:
-        grouped_leads: Dictionary of assignee -> leads
+        leads: List of lead dictionaries
         company_name: Company name
         
     Returns:
@@ -257,123 +229,83 @@ def create_chunked_documents(
     """
     documents = []
     
-    for assignee, leads in grouped_leads.items():
+    for lead_index, lead in enumerate(leads):
         try:
-            # Create rich text block for this assignee
-            rich_text = create_rich_text_block(leads, company_name, assignee)
+            lead_id = lead.get('id', f'lead_{lead_index}')
             
-            # Split into optimal chunks
-            chunks = split_text_into_chunks(rich_text)
+            # Use the new prepare_record_for_pinecone format
+            text_blob, metadata = prepare_record_for_pinecone(lead)
             
-            # Get common metadata from the leads
-            assignee_id = get_most_common_value(leads, 'assignedToId')
-            latest_generated_at = get_latest_date(leads, 'generatedAt')
-            latest_updated_at = get_latest_date(leads, 'updatedAt')
-            project_cities = get_unique_values(leads, 'projectCity')
-            project_categories = get_unique_values(leads, 'projectCategory')
-            project_stages = get_unique_values(leads, 'projectStage')
-            project_sources = get_unique_values(leads, 'projectSource')
+            # Create document ID
+            doc_id = f"{company_name}_{lead_id}"
             
-            # Create document for each chunk
-            for chunk_index, chunk_text in enumerate(chunks):
-                doc_id = f"{company_name}_{assignee}_{chunk_index}"
-                
-                metadata = {
-                    "assignedTo": assignee,
-                    "assignedToId": assignee_id or "",
-                    "company": company_name,
-                    "generatedAt": latest_generated_at or "",
-                    "updatedAt": latest_updated_at or "",
-                    "projectCity": ", ".join(project_cities) if project_cities else "",
-                    "projectCategory": ", ".join(project_categories) if project_categories else "",
-                    "projectStage": ", ".join(project_stages) if project_stages else "",
-                    "projectSource": ", ".join(project_sources) if project_sources else "",
-                    "chunk_index": chunk_index,
-                    "total_chunks": len(chunks),
-                    "total_leads": len(leads),
-                    "lead_ids": [lead.get('id', '') for lead in leads]
-                }
-                
-                # Remove empty values
-                metadata = {k: v for k, v in metadata.items() if v}
-                
-                documents.append({
-                    "id": doc_id,
-                    "text": chunk_text,
-                    "metadata": metadata
-                })
+            # Add company and lead_id to metadata
+            metadata['company'] = company_name
+            metadata['lead_id'] = lead_id
+            
+            documents.append({
+                "id": doc_id,
+                "chunk_text": text_blob,
+                "metadata": metadata
+            })
         
         except Exception as e:
-            logger.error(f"Error processing assignee {assignee}: {e}")
+            logger.error(f"Error processing lead {lead.get('id', lead_index)}: {e}")
             continue
     
-    logger.info(f"Created {len(documents)} chunked documents for {len(grouped_leads)} assignees")
+    logger.info(f"Created {len(documents)} documents from {len(leads)} leads")
     return documents
 
-def get_most_common_value(leads: List[Dict[str, Any]], field: str) -> Optional[str]:
-    """Get the most common value for a field across leads."""
-    values = []
-    for lead in leads:
-        value = lead.get(field, '')
-        # Handle different data types safely
-        if value:
-            if isinstance(value, str):
-                value = value.strip()
-                if value:
-                    values.append(value)
-            else:
-                # Convert non-string values to string
-                values.append(str(value))
+def format_date_field(date_value: Any) -> str:
+    """Format date field to string for display."""
+    if not date_value:
+        return ""
     
-    if not values:
-        return None
-    
-    # Return most common value
-    from collections import Counter
-    counter = Counter(values)
-    return counter.most_common(1)[0][0] if counter else None
+    # Handle Firebase DatetimeWithNanoseconds objects
+    if hasattr(date_value, 'strftime'):
+        try:
+            return date_value.isoformat()
+        except:
+            return str(date_value)
+    elif isinstance(date_value, str):
+        return date_value.strip()
+    else:
+        return str(date_value)
 
-def get_latest_date(leads: List[Dict[str, Any]], field: str) -> Optional[str]:
-    """Get the latest date value for a field across leads."""
-    dates = []
-    for lead in leads:
-        date_value = lead.get(field, '')
-        if date_value:
-            # Handle Firebase DatetimeWithNanoseconds objects
-            if hasattr(date_value, 'strftime'):
-                try:
-                    # Convert to ISO string for comparison
-                    dates.append(date_value.isoformat())
-                except:
-                    dates.append(str(date_value))
-            elif isinstance(date_value, str):
-                date_value = date_value.strip()
-                if date_value:
-                    dates.append(date_value)
-            else:
-                dates.append(str(date_value))
+def format_date_for_metadata(date_value: Any) -> int:
+    """Format date field to Unix timestamp for Pinecone metadata filtering."""
+    if not date_value:
+        return 0
     
-    if not dates:
-        return None
+    import datetime
     
-    # Simple string comparison should work for ISO dates
-    return max(dates)
+    # Handle Firebase DatetimeWithNanoseconds objects
+    if hasattr(date_value, 'timestamp'):
+        try:
+            return int(date_value.timestamp())
+        except:
+            pass
+    
+    if hasattr(date_value, 'strftime'):
+        try:
+            return int(date_value.timestamp())
+        except:
+            pass
+    
+    # Handle string dates
+    if isinstance(date_value, str):
+        try:
+            # Try parsing ISO format
+            dt = datetime.datetime.fromisoformat(date_value.replace('Z', '+00:00'))
+            return int(dt.timestamp())
+        except:
+            try:
+                # Try other common formats
+                dt = datetime.datetime.strptime(date_value, "%Y-%m-%d")
+                return int(dt.timestamp())
+            except:
+                return 0
+    
+    return 0
 
-def get_unique_values(leads: List[Dict[str, Any]], field: str) -> List[str]:
-    """Get unique non-empty values for a field across leads."""
-    values = set()
-    for lead in leads:
-        value = lead.get(field, '')
-        if value:
-            # Handle different data types safely
-            if isinstance(value, str):
-                value = value.strip()
-                if value and value.lower() not in ['', 'null', 'none', 'n/a']:
-                    values.add(value)
-            else:
-                # Convert non-string values to string
-                str_value = str(value)
-                if str_value and str_value.lower() not in ['', 'null', 'none', 'n/a']:
-                    values.add(str_value)
-    
-    return sorted(list(values))
+
